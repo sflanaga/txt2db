@@ -1,13 +1,14 @@
 use anyhow::{Context, Result};
 use bzip2::read::BzDecoder;
+use crossbeam_channel::{bounded, Sender};
 use flate2::read::GzDecoder;
-use rayon::prelude::*;
 use regex::Regex;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::thread;
 use walkdir::WalkDir;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
@@ -17,6 +18,9 @@ pub struct SplicerConfig {
     pub max_buffer_size: usize,
     pub path_filter: Option<Regex>,
     pub recursive: bool,
+    /// Number of threads to use for file reading/splicing.
+    /// If 0, defaults to 4.
+    pub thread_count: usize,
 }
 
 impl Default for SplicerConfig {
@@ -26,6 +30,7 @@ impl Default for SplicerConfig {
             max_buffer_size: 2 * 1024 * 1024,
             path_filter: None,
             recursive: true,
+            thread_count: 0,
         }
     }
 }
@@ -35,6 +40,8 @@ pub struct SplicerStats {
     pub file_count: AtomicUsize,
     pub byte_count: AtomicUsize,
     pub chunk_count: AtomicUsize,
+    // Tracks how many files are sitting in the internal channel waiting to be processed
+    pub paths_queued: AtomicIsize,
 }
 
 pub enum InputSource {
@@ -46,14 +53,14 @@ pub enum InputSource {
 pub struct IoSplicer {
     config: SplicerConfig,
     stats: Arc<SplicerStats>,
-    sender: crossbeam_channel::Sender<String>,
+    sender: Sender<String>,
 }
 
 impl IoSplicer {
     pub fn new(
         config: SplicerConfig,
         stats: Arc<SplicerStats>,
-        sender: crossbeam_channel::Sender<String>,
+        sender: Sender<String>,
     ) -> Self {
         Self {
             config,
@@ -69,50 +76,85 @@ impl IoSplicer {
                 self.process_reader(stdin.lock())?;
             }
             InputSource::FileList(paths) => {
-                // Process the provided list in parallel
-                paths.par_iter().try_for_each(|path| self.process_file(path))?;
+                self.run_parallel_splicers(paths.into_iter())?;
             }
             InputSource::Directory(root) => {
-                let mut walker = WalkDir::new(&root);
-                if !self.config.recursive {
-                    walker = walker.max_depth(1);
-                }
+                let config = self.config.clone();
+                let walker = WalkDir::new(&root).max_depth(if config.recursive { usize::MAX } else { 1 });
 
-                // FIX: Use par_bridge() to stream files immediately into the thread pool.
-                // This prevents waiting for the entire directory walk to finish before processing starts.
-                walker.into_iter()
-                    .par_bridge() 
-                    .try_for_each(|entry_res| -> Result<()> {
-                        // If we hit a permission error on a file, we might want to log and continue, 
-                        // but here we follow typical strict behavior or ignore access errors.
-                        if let Ok(entry) = entry_res {
-                            let path = entry.path();
-                            if path.is_file() {
-                                // Check regex filter
-                                let include = if let Some(re) = &self.config.path_filter {
-                                    path.to_str().map(|s| re.is_match(s)).unwrap_or(false)
-                                } else {
-                                    true
-                                };
-
-                                if include {
-                                    // Process file in this rayon thread
-                                    self.process_file(path)?;
+                let path_iter = walker
+                    .into_iter()
+                    .filter_map(move |e| e.ok())
+                    .filter(move |e| {
+                        if !e.file_type().is_file() {
+                            return false;
+                        }
+                        if let Some(re) = &config.path_filter {
+                            if let Some(s) = e.path().to_str() {
+                                if !re.is_match(s) {
+                                    return false;
                                 }
                             }
                         }
-                        Ok(())
-                    })?;
+                        true
+                    })
+                    .map(|e| e.path().to_path_buf());
+
+                self.run_parallel_splicers(path_iter)?;
             }
         }
         Ok(())
     }
 
+    fn run_parallel_splicers<I>(&self, path_iter: I) -> Result<()>
+    where
+        I: Iterator<Item = PathBuf> + Send,
+    {
+        // 1. Channel to distribute file paths to splicer threads
+        let (path_tx, path_rx) = bounded::<PathBuf>(1024);
+
+        let num_threads = if self.config.thread_count > 0 {
+            self.config.thread_count
+        } else {
+            4
+        };
+
+        // 2. Orchestrate threads
+        thread::scope(|s| {
+            // A. Walker Thread: Pushes paths into queue
+            s.spawn(move || {
+                for path in path_iter {
+                    self.stats.paths_queued.fetch_add(1, Ordering::Relaxed);
+                    if path_tx.send(path).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            // B. Splicer Threads: Pull paths, read file, push chunks
+            for _ in 0..num_threads {
+                let rx = path_rx.clone();
+                s.spawn(move || {
+                    while let Ok(path) = rx.recv() {
+                        // We popped a file from queue, so decrement stat
+                        self.stats.paths_queued.fetch_sub(1, Ordering::Relaxed);
+
+                        if let Err(e) = self.process_file(&path) {
+                            eprintln!("Error processing {:?}: {}", path, e);
+                        }
+                    }
+                });
+            }
+        });
+
+        Ok(())
+    }
+
     fn process_file(&self, path: &Path) -> Result<()> {
-        // We ignore file open errors (like permission denied) to keep the batch moving
+        // Silently ignore open errors (permissions etc) to keep moving
         let file = match File::open(path) {
             Ok(f) => f,
-            Err(_) => return Ok(()), 
+            Err(_) => return Ok(()),
         };
         
         self.stats.file_count.fetch_add(1, Ordering::Relaxed);
