@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use bzip2::read::BzDecoder;
 use flate2::read::GzDecoder;
+use rayon::prelude::*;
 use regex::Regex;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
@@ -68,9 +69,8 @@ impl IoSplicer {
                 self.process_reader(stdin.lock())?;
             }
             InputSource::FileList(paths) => {
-                for path in paths {
-                    self.process_file(&path)?;
-                }
+                // Process the provided list in parallel
+                paths.par_iter().try_for_each(|path| self.process_file(path))?;
             }
             InputSource::Directory(root) => {
                 let mut walker = WalkDir::new(&root);
@@ -78,34 +78,47 @@ impl IoSplicer {
                     walker = walker.max_depth(1);
                 }
 
-                // Note: In a production app, you might parallelize the file walking/opening here too
-                // using something like `par_iter` from Rayon or a thread pool, but we keep it serial
-                // here to ensure the Splicer feeds the worker pool in a defined order.
-                for entry in walker.into_iter().filter_map(|e| e.ok()) {
-                    let path = entry.path();
-                    if path.is_file() {
-                        if let Some(re) = &self.config.path_filter {
-                            if let Some(path_str) = path.to_str() {
-                                if !re.is_match(path_str) {
-                                    continue;
+                // FIX: Use par_bridge() to stream files immediately into the thread pool.
+                // This prevents waiting for the entire directory walk to finish before processing starts.
+                walker.into_iter()
+                    .par_bridge() 
+                    .try_for_each(|entry_res| -> Result<()> {
+                        // If we hit a permission error on a file, we might want to log and continue, 
+                        // but here we follow typical strict behavior or ignore access errors.
+                        if let Ok(entry) = entry_res {
+                            let path = entry.path();
+                            if path.is_file() {
+                                // Check regex filter
+                                let include = if let Some(re) = &self.config.path_filter {
+                                    path.to_str().map(|s| re.is_match(s)).unwrap_or(false)
+                                } else {
+                                    true
+                                };
+
+                                if include {
+                                    // Process file in this rayon thread
+                                    self.process_file(path)?;
                                 }
                             }
                         }
-                        self.process_file(path)?;
-                    }
-                }
+                        Ok(())
+                    })?;
             }
         }
         Ok(())
     }
 
     fn process_file(&self, path: &Path) -> Result<()> {
-        let file = File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+        // We ignore file open errors (like permission denied) to keep the batch moving
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(_) => return Ok(()), 
+        };
+        
         self.stats.file_count.fetch_add(1, Ordering::Relaxed);
 
         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
 
-        // Transparent Decompression
         match ext {
             "gz" => self.process_reader(BufReader::new(GzDecoder::new(file))),
             "bz2" => self.process_reader(BufReader::new(BzDecoder::new(file))),
