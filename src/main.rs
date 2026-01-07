@@ -1,8 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossbeam_channel::bounded;
 use dashmap::DashMap;
 use io_splicer_demo::{InputSource, IoSplicer, SplicerConfig, SplicerStats};
 use regex::Regex;
+use std::env;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -10,109 +11,108 @@ use std::thread;
 use std::time::Duration;
 
 fn main() -> Result<()> {
+    // 1. Parse CLI Arguments
+    // Usage: cargo run -- [directory] [regex_filter]
+    let args: Vec<String> = env::args().collect();
+    
+    let target_dir = args.get(1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    
+    // Optional Regex filter from 2nd argument
+    let filter_pattern = args.get(2).cloned();
+    let path_filter = if let Some(pattern) = filter_pattern {
+        println!("Filtering files matching: {}", pattern);
+        Some(Regex::new(&pattern).context("Invalid regex provided")?)
+    } else {
+        None
+    };
+
+    // 2. Setup Configuration
     let config = SplicerConfig {
-        chunk_size: 256 * 1024,
-        max_buffer_size: 1024 * 1024,
-        // Update regex to include compressed extensions
-        path_filter: Some(Regex::new(r"\.(rs|md|txt|log|gz|bz2|zst)$").unwrap()),
+        chunk_size: 256 * 1024,       // 256KB chunks
+        max_buffer_size: 1024 * 1024, // 1MB buffer
+        path_filter,
         recursive: true,
     };
 
-    let stats = Arc::new(SplicerStats::default());
-    // DashMap is the "Java-like" concurrent map. It is sharded for high concurrency.
+    // 3. Setup Concurrent Map (Java-like ConcurrentHashMap)
+    // DashMap uses sharding to allow high concurrency without a global lock.
     let word_counts = Arc::new(DashMap::new());
-    
-    // Backpressure channel: prevent reading files infinitely faster than we can parse
-    let (tx, rx) = bounded::<String>(50); 
 
-    // --- Ticker Thread ---
-    let stats_ticker = stats.clone();
+    // 4. Setup Stats and Channels
+    let stats = Arc::new(SplicerStats::default());
+    let (tx, rx) = bounded::<String>(100);
+
+    // 5. Start Ticker Thread
+    let stats_monitor = stats.clone();
     thread::spawn(move || {
         let start = std::time::Instant::now();
         loop {
             thread::sleep(Duration::from_secs(1));
             let elapsed = start.elapsed().as_secs_f64();
-            let files = stats_ticker.file_count.load(Ordering::Relaxed);
-            let bytes = stats_ticker.byte_count.load(Ordering::Relaxed);
-            let mb = bytes as f64 / 1024.0 / 1024.0;
+            let files = stats_monitor.file_count.load(Ordering::Relaxed);
+            let bytes = stats_monitor.byte_count.load(Ordering::Relaxed);
+            let chunks = stats_monitor.chunk_count.load(Ordering::Relaxed);
             
+            let mb = bytes as f64 / 1024.0 / 1024.0;
             println!(
-                "Processing... [Files: {}] [MB Processed: {:.2}] [Avg Rate: {:.2} MB/s]", 
-                files, mb, mb / elapsed
+                "Processing: [Files: {}] [Chunks: {}] [Bytes: {:.2} MB] [Avg Rate: {:.2} MB/s]", 
+                files, chunks, mb, mb / elapsed
             );
         }
     });
 
-    // --- Worker Pool (Word Counter) ---
-    // Optimization: While DashMap is fast, high contention on very common words ("the", "a") 
-    // can still slow things down. A common pattern is to aggregate locally in a HashMap 
-    // inside the thread and merge into DashMap periodically or at the end.
-    // However, since you asked for the DashMap usage specifically, we use it directly here.
-    
+    // 6. Start Worker Threads (Word Counters)
+    let num_workers = 4;
     let mut handles = vec![];
-    let num_threads = std::thread::available_parallelism().unwrap().get();
     
-    for _ in 0..num_threads {
+    for _ in 0..num_workers {
         let rx_worker = rx.clone();
         let map_worker = word_counts.clone();
         
         handles.push(thread::spawn(move || {
             while let Ok(chunk) = rx_worker.recv() {
-                // Simple tokenizer: split by whitespace and cleanup punctuation
+                // Split by whitespace and count
                 for word in chunk.split_whitespace() {
-                    let clean_word = word
-                        .trim_matches(|c: char| !c.is_alphanumeric())
-                        .to_lowercase();
+                    // Normalize to lowercase to avoid "The" vs "the"
+                    let w = word.to_lowercase();
                     
-                    if !clean_word.is_empty() {
-                        // DashMap handles the locking/sharding internally
-                        *map_worker.entry(clean_word).or_insert(0) += 1;
-                    }
+                    // Atomic update in the map
+                    *map_worker.entry(w).or_insert(0) += 1;
                 }
             }
         }));
     }
 
-    // --- IO Splicer (Producer) ---
-    let input = if let Some(arg) = std::env::args().nth(1) {
-        InputSource::Directory(PathBuf::from(arg))
-    } else {
-        println!("Scanning current directory...");
-        InputSource::Directory(PathBuf::from("."))
-    };
-
+    // 7. Run the Splicer
+    println!("Starting scan on {:?}...", target_dir);
     let splicer = IoSplicer::new(config, stats.clone(), tx);
     
-    // This blocks until all files are read and chunks sent
-    if let Err(e) = splicer.run(input) {
-        eprintln!("Splicer error: {:?}", e);
-    }
-    
-    // Drop the splicer (and its sender) so workers can exit loop
+    splicer.run(InputSource::Directory(target_dir))?;
+
+    // Drop splicer to close the sender channel, signaling workers to finish
     drop(splicer);
 
-    // Wait for all counting to finish
+    // Wait for workers to finish counting
     for h in handles {
         h.join().unwrap();
     }
 
-    // --- Final Report ---
-    println!("\n--- Final Stats ---");
-    println!("Files read: {}", stats.file_count.load(Ordering::Relaxed));
-    println!("Total unique words: {}", word_counts.len());
-    
-    println!("\n--- Top 25 Words ---");
-    // Extract to Vec to sort
-    let mut count_vec: Vec<_> = word_counts
+    // 8. Aggregate and Sort Results
+    println!("\n--- Processing Complete ---");
+    println!("Total Unique Words: {}", word_counts.len());
+    println!("Top 20 Words:");
+
+    // Convert DashMap to Vec to sort
+    let mut count_vec: Vec<(String, usize)> = word_counts
         .iter()
-        .map(|pair| (pair.key().clone(), *pair.value()))
+        .map(|entry| (entry.key().clone(), *entry.value()))
         .collect();
-    
+
     // Sort descending by count
     count_vec.sort_by(|a, b| b.1.cmp(&a.1));
 
-    for (i, (word, count)) in count_vec.iter().take(25).enumerate() {
-        println!("{:2}. {:<20} : {}", i + 1, word, count);
+    for (i, (word, count)) in count_vec.iter().take(20).enumerate() {
+        println!("{}. '{}': {}", i + 1, word, count);
     }
 
     Ok(())
