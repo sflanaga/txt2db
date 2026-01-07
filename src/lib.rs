@@ -1,20 +1,15 @@
 use anyhow::{Context, Result};
+use bzip2::read::BzDecoder;
+use flate2::read::GzDecoder;
 use regex::Regex;
-use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use walkdir::WalkDir;
-
-// Decompression imports
-use bzip2::read::BzDecoder;
-use flate2::read::GzDecoder;
-use xz2::read::XzDecoder;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
-/// Configuration for the IoSplicer
 #[derive(Clone, Debug)]
 pub struct SplicerConfig {
     pub chunk_size: usize,
@@ -70,7 +65,6 @@ impl IoSplicer {
         match input {
             InputSource::Stdin => {
                 let stdin = io::stdin();
-                // Stdin is usually plain text, but you could add magic byte detection here if needed
                 self.process_reader(stdin.lock())?;
             }
             InputSource::FileList(paths) => {
@@ -84,6 +78,9 @@ impl IoSplicer {
                     walker = walker.max_depth(1);
                 }
 
+                // Note: In a production app, you might parallelize the file walking/opening here too
+                // using something like `par_iter` from Rayon or a thread pool, but we keep it serial
+                // here to ensure the Splicer feeds the worker pool in a defined order.
                 for entry in walker.into_iter().filter_map(|e| e.ok()) {
                     let path = entry.path();
                     if path.is_file() {
@@ -106,27 +103,15 @@ impl IoSplicer {
         let file = File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
         self.stats.file_count.fetch_add(1, Ordering::Relaxed);
 
-        // Determine compression based on extension
-        let extension = path.extension().and_then(OsStr::to_str).unwrap_or("");
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
 
-        // We wrap the raw file in a BufReader first to ensure efficient reads from disk
-        // before the decompressor tries to process it.
-        let buf_file = BufReader::new(file);
-
-        // Box<dyn Read> allows us to treat all decoders uniformly
-        let decoder: Box<dyn Read> = match extension {
-            "gz" | "gzip" => Box::new(GzDecoder::new(buf_file)),
-            "bz2" | "bzip2" => Box::new(BzDecoder::new(buf_file)),
-            "xz" | "lzma" => Box::new(XzDecoder::new(buf_file)),
-            "zst" | "zstd" => {
-                // zstd decoder can fail initialization
-                Box::new(ZstdDecoder::new(buf_file).context("Failed to init zstd decoder")?)
-            }
-            _ => Box::new(buf_file), // Treat as plain text
-        };
-
-        // Pass the (potentially decompressed) stream to the splitter
-        self.process_reader(decoder)
+        // Transparent Decompression
+        match ext {
+            "gz" => self.process_reader(BufReader::new(GzDecoder::new(file))),
+            "bz2" => self.process_reader(BufReader::new(BzDecoder::new(file))),
+            "zst" => self.process_reader(BufReader::new(ZstdDecoder::new(file)?)),
+            _ => self.process_reader(BufReader::new(file)),
+        }
     }
 
     fn process_reader<R: Read>(&self, mut reader: R) -> Result<()> {

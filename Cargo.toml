@@ -8,8 +8,7 @@ crossbeam-channel = "0.5"
 regex = "1"
 walkdir = "2"
 anyhow = "1.0"
-# Decompression support
-flate2 = "1.0"      # gzip
-zstd = "0.13"       # zstd
-bzip2 = "0.4"       # bzip2
-xz2 = "0.1"         # xz/lzma
+dashmap = "5"     # For concurrent "Java-like" map
+flate2 = "1.0"    # gzip
+bzip2 = "0.4"     # bzip2
+zstd = "0.13"     # zstd

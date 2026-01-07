@@ -1,5 +1,6 @@
 use anyhow::Result;
 use crossbeam_channel::bounded;
+use dashmap::DashMap;
 use io_splicer_demo::{InputSource, IoSplicer, SplicerConfig, SplicerStats};
 use regex::Regex;
 use std::path::PathBuf;
@@ -9,20 +10,22 @@ use std::thread;
 use std::time::Duration;
 
 fn main() -> Result<()> {
-    // 1. Setup Configuration
-    // In a real app, these would come from CLI args (e.g. using clap)
     let config = SplicerConfig {
-        chunk_size: 256 * 1024,      // 256KB
-        max_buffer_size: 1024 * 1024, // 1MB
-        path_filter: Some(Regex::new(r"\.rs$|\.md$|\.txt$").unwrap()), // Only process text-like files
+        chunk_size: 256 * 1024,
+        max_buffer_size: 1024 * 1024,
+        // Update regex to include compressed extensions
+        path_filter: Some(Regex::new(r"\.(rs|md|txt|log|gz|bz2|zst)$").unwrap()),
         recursive: true,
     };
 
-    // 2. Setup Stats and Communication
     let stats = Arc::new(SplicerStats::default());
-    let (tx, rx) = bounded::<String>(100); // Backpressure channel
+    // DashMap is the "Java-like" concurrent map. It is sharded for high concurrency.
+    let word_counts = Arc::new(DashMap::new());
+    
+    // Backpressure channel: prevent reading files infinitely faster than we can parse
+    let (tx, rx) = bounded::<String>(50); 
 
-    // 3. Start Ticker Thread (Reporting)
+    // --- Ticker Thread ---
     let stats_ticker = stats.clone();
     thread::spawn(move || {
         let start = std::time::Instant::now();
@@ -31,65 +34,86 @@ fn main() -> Result<()> {
             let elapsed = start.elapsed().as_secs_f64();
             let files = stats_ticker.file_count.load(Ordering::Relaxed);
             let bytes = stats_ticker.byte_count.load(Ordering::Relaxed);
-            let chunks = stats_ticker.chunk_count.load(Ordering::Relaxed);
-            
             let mb = bytes as f64 / 1024.0 / 1024.0;
+            
             println!(
-                "Stats: [Files: {}] [Chunks: {}] [Bytes: {:.2} MB] [Rate: {:.2} MB/s]", 
-                files, chunks, mb, mb / elapsed
+                "Processing... [Files: {}] [MB Processed: {:.2}] [Avg Rate: {:.2} MB/s]", 
+                files, mb, mb / elapsed
             );
         }
     });
 
-    // 4. Start Consumer Threads (The "Thread Pool")
-    // These simulate the "other things to process" mentioned in the prompt.
+    // --- Worker Pool (Word Counter) ---
+    // Optimization: While DashMap is fast, high contention on very common words ("the", "a") 
+    // can still slow things down. A common pattern is to aggregate locally in a HashMap 
+    // inside the thread and merge into DashMap periodically or at the end.
+    // However, since you asked for the DashMap usage specifically, we use it directly here.
+    
     let mut handles = vec![];
-    for id in 0..4 {
+    let num_threads = std::thread::available_parallelism().unwrap().get();
+    
+    for _ in 0..num_threads {
         let rx_worker = rx.clone();
+        let map_worker = word_counts.clone();
+        
         handles.push(thread::spawn(move || {
             while let Ok(chunk) = rx_worker.recv() {
-                // Simulate work: e.g., counting lines or words in the chunk
-                let line_count = chunk.lines().count();
-                // To avoid spamming stdout, we just do busy work
-                let _ = line_count; 
-                // println!("Worker {} processed chunk with {} lines", id, line_count);
+                // Simple tokenizer: split by whitespace and cleanup punctuation
+                for word in chunk.split_whitespace() {
+                    let clean_word = word
+                        .trim_matches(|c: char| !c.is_alphanumeric())
+                        .to_lowercase();
+                    
+                    if !clean_word.is_empty() {
+                        // DashMap handles the locking/sharding internally
+                        *map_worker.entry(clean_word).or_insert(0) += 1;
+                    }
+                }
             }
         }));
     }
 
-    // 5. Determine Input and Run Splicer
-    // For this demo, we'll scan the current directory if no args, or a specific dir if arg provided
+    // --- IO Splicer (Producer) ---
     let input = if let Some(arg) = std::env::args().nth(1) {
         InputSource::Directory(PathBuf::from(arg))
     } else {
-        println!("No directory argument provided. Scanning current directory recursively...");
+        println!("Scanning current directory...");
         InputSource::Directory(PathBuf::from("."))
     };
 
-    println!("Starting IO Splicer...");
     let splicer = IoSplicer::new(config, stats.clone(), tx);
     
-    // Run the splicer (blocks until all inputs are read)
+    // This blocks until all files are read and chunks sent
     if let Err(e) = splicer.run(input) {
         eprintln!("Splicer error: {:?}", e);
     }
-
-    // Drop the sender so the workers know to exit
-    // (IoSplicer owns the sender, so it drops here when splicer goes out of scope)
+    
+    // Drop the splicer (and its sender) so workers can exit loop
     drop(splicer);
 
-    // Wait for workers
+    // Wait for all counting to finish
     for h in handles {
         h.join().unwrap();
     }
 
-    println!("Done.");
+    // --- Final Report ---
+    println!("\n--- Final Stats ---");
+    println!("Files read: {}", stats.file_count.load(Ordering::Relaxed));
+    println!("Total unique words: {}", word_counts.len());
     
-    // Final Stats
-    let files = stats.file_count.load(Ordering::Relaxed);
-    let bytes = stats.byte_count.load(Ordering::Relaxed);
-    let chunks = stats.chunk_count.load(Ordering::Relaxed);
-    println!("Final: {} files, {} bytes, {} chunks processed.", files, bytes, chunks);
+    println!("\n--- Top 25 Words ---");
+    // Extract to Vec to sort
+    let mut count_vec: Vec<_> = word_counts
+        .iter()
+        .map(|pair| (pair.key().clone(), *pair.value()))
+        .collect();
+    
+    // Sort descending by count
+    count_vec.sort_by(|a, b| b.1.cmp(&a.1));
+
+    for (i, (word, count)) in count_vec.iter().take(25).enumerate() {
+        println!("{:2}. {:<20} : {}", i + 1, word, count);
+    }
 
     Ok(())
 }
