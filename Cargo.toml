@@ -1,0 +1,15 @@
+[package]
+name = "io_splicer_demo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossbeam-channel = "0.5"
+regex = "1"
+walkdir = "2"
+anyhow = "1.0"
+# Decompression support
+flate2 = "1.0"      # gzip
+zstd = "0.13"       # zstd
+bzip2 = "0.4"       # bzip2
+xz2 = "0.1"         # xz/lzma
