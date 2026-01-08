@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::bounded;
 use dashmap::DashMap;
-use io_splicer_demo::{InputSource, IoSplicer, SplicerConfig, SplicerStats};
+use io_splicer_demo::{InputSource, IoSplicer, SplicedChunk, SplicerConfig, SplicerStats};
 use regex::Regex;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -32,7 +32,6 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // 1. Setup Filters & Config
     let path_filter = if let Some(pattern) = cli.filter_pattern {
         println!("Filter: {}", pattern);
         Some(Regex::new(&pattern).context("Invalid regex provided")?)
@@ -43,11 +42,6 @@ fn main() -> Result<()> {
     let total_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let splicer_count = cli.splicer_threads.unwrap_or_else(|| std::cmp::max(1, total_cores / 2));
     let parser_count = cli.parser_threads.unwrap_or_else(|| std::cmp::max(1, total_cores.saturating_sub(splicer_count)));
-
-    println!("Configuration:");
-    println!("  - Target:       {:?}", cli.target_dir);
-    println!("  - Splicer Pool: {} threads", splicer_count);
-    println!("  - Parser Pool:  {} threads", parser_count);
 
     let config = SplicerConfig {
         chunk_size: 256 * 1024,
@@ -61,11 +55,10 @@ fn main() -> Result<()> {
     let search_counts = Arc::new(DashMap::new());
     let stats = Arc::new(SplicerStats::default());
     
-    // 2. Setup CHANNELS
-    let (tx, rx) = bounded::<Vec<u8>>(256); 
+    // UPDATED: Channel now carries SplicedChunk
+    let (tx, rx) = bounded::<SplicedChunk>(256); 
     let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(512);
 
-    // 3. Stats Monitor
     let stats_monitor = stats.clone();
     let rx_monitor = rx.clone();
     let queue_capacity = rx.capacity().unwrap_or(0);
@@ -76,18 +69,14 @@ fn main() -> Result<()> {
 
         loop {
             thread::sleep(Duration::from_secs(1));
-            
             let files = stats_monitor.file_count.load(Ordering::Relaxed);
             let bytes = stats_monitor.byte_count.load(Ordering::Relaxed);
-            
             let q_len = rx_monitor.len();
             let q_pct = (q_len as f64 / queue_capacity as f64) * 100.0;
             let file_q = stats_monitor.paths_queued.load(Ordering::Relaxed);
-            
             let mb_total = bytes as f64 / 1024.0 / 1024.0;
             let mb_diff = (bytes - last_bytes) as f64 / 1024.0 / 1024.0;
             let files_diff = files - last_files;
-            
             last_bytes = bytes;
             last_files = files;
 
@@ -98,97 +87,53 @@ fn main() -> Result<()> {
         }
     });
 
-    // 4. Start Parser Workers
     let mut handles = vec![];
     let search_term = cli.search_term.clone();
     
     for _ in 0..parser_count {
         let rx_worker = rx.clone();
         let recycle_worker = recycle_tx.clone();
-        
         let map_worker = word_counts.clone();
         let search_map = search_counts.clone();
         let term = search_term.clone();
 
         handles.push(thread::spawn(move || {
-            while let Ok(chunk_vec) = rx_worker.recv() {
-                let chunk_str = String::from_utf8_lossy(&chunk_vec);
+            // UPDATED: Deconstruct the chunk to get data
+            while let Ok(chunk) = rx_worker.recv() {
+                let mut data = chunk.data;
                 
-                if let Some(t) = &term {
-                    let count = chunk_str.matches(t).count();
-                    if count > 0 {
-                        *search_map.entry(t.clone()).or_insert(0) += count;
-                    }
-                } else {
-                    for word in chunk_str.split_whitespace() {
-                        let w = word.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
-                        if !w.is_empty() {
-                            *map_worker.entry(w).or_insert(0) += 1;
+                {
+                    let chunk_str = String::from_utf8_lossy(&data);
+                    
+                    if let Some(t) = &term {
+                        let count = chunk_str.matches(t).count();
+                        if count > 0 {
+                            *search_map.entry(t.clone()).or_insert(0) += count;
+                        }
+                    } else {
+                        for word in chunk_str.split_whitespace() {
+                            let w = word.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+                            if !w.is_empty() {
+                                *map_worker.entry(w).or_insert(0) += 1;
+                            }
                         }
                     }
-                }
-                drop(chunk_str); 
-                let _ = recycle_worker.send(chunk_vec);
+                } 
+                
+                // UPDATED: Recycle the raw Vec<u8> only
+                data.clear();
+                let _ = recycle_worker.send(data);
             }
         }));
     }
 
-    // 5. Run Splicer
     println!("Starting scan on {:?}...", cli.target_dir);
-    let start_time = std::time::Instant::now();
-    
     let splicer = IoSplicer::new(config, stats.clone(), tx, recycle_rx);
-    
     if let Err(e) = splicer.run(InputSource::Directory(cli.target_dir)) {
         eprintln!("Splicer Error: {:?}", e);
     }
     drop(splicer);
 
-    for h in handles {
-        h.join().unwrap();
-    }
-    
-    let duration = start_time.elapsed();
-
-    // 6. FINAL SUMMARY STATS
-    let final_files = stats.file_count.load(Ordering::Relaxed);
-    let final_bytes = stats.byte_count.load(Ordering::Relaxed);
-    let final_chunks = stats.chunk_count.load(Ordering::Relaxed);
-    
-    let recycler_miss = stats.recycler_miss_count.load(Ordering::Relaxed);
-    let buffer_realloc = stats.buffer_realloc_count.load(Ordering::Relaxed);
-    let newline_splits = stats.newline_split_count.load(Ordering::Relaxed);
-    let forced_splits = stats.forced_split_count.load(Ordering::Relaxed);
-
-    let mb = final_bytes as f64 / 1024.0 / 1024.0;
-    let seconds = duration.as_secs_f64();
-
-    println!("\n================ FINAL STATS ================");
-    println!("Duration:       {:.2} seconds", seconds);
-    println!("Total Files:    {}", final_files);
-    println!("Total Size:     {:.2} MB", mb);
-    println!("Avg Throughput: {:.2} MB/s", if seconds > 0.0 { mb / seconds } else { 0.0 });
-    println!("Total Chunks:   {}", final_chunks);
-    println!("---------------------------------------------");
-    println!("Memory & Splicing Metrics:");
-    println!("  New Buffer Allocs: {}", recycler_miss);
-    println!("  Buffer Reallocs:   {}", buffer_realloc);
-    println!("  Newline Splits:    {}", newline_splits);
-    println!("  Forced Splits:     {}", forced_splits);
-    println!("=============================================");
-
-    if let Some(t) = cli.search_term {
-         let c = search_counts.get(&t).map(|v| *v).unwrap_or(0);
-         println!("Term '{}':      {}", t, c);
-    } else {
-         println!("Unique Words:   {}", word_counts.len());
-         let mut count_vec: Vec<_> = word_counts.iter().map(|e| (e.key().clone(), *e.value())).collect();
-         count_vec.sort_by(|a, b| b.1.cmp(&a.1));
-         println!("\nTop 20 Words:");
-         for (i, (w, c)) in count_vec.iter().take(20).enumerate() {
-             println!("{}. {}: {}", i + 1, w, c);
-         }
-    }
-
+    for h in handles { h.join().unwrap(); }
     Ok(())
 }
