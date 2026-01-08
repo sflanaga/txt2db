@@ -99,7 +99,17 @@ struct DbStats {
     bytes_processed: AtomicUsize,
 }
 
+struct RunMetadata {
+    regex: String,
+    command_args: String,
+    created_at: String,
+}
+
 fn main() -> Result<()> {
+    // Capture raw args for history logging
+    let raw_args: Vec<String> = std::env::args().collect();
+    let command_line = raw_args.join(" ");
+
     let cli = Cli::parse();
 
     // Setup Regexes
@@ -227,13 +237,20 @@ fn main() -> Result<()> {
         }
     });
 
+    // Run Metadata for DB
+    let run_meta = RunMetadata {
+        regex: cli.regex.clone(),
+        command_args: command_line,
+        created_at: format!("{:?}", SystemTime::now()), // Simple debug format to avoid chrono dep issues
+    };
+
     // Start DB Worker
     let batch_size = cli.batch_size;
     let track_matches = cli.track_matches;
     let col_defs_for_db = columns.iter().map(|c| c.name.clone()).collect();
     let db_worker_stats = db_stats.clone();
     let db_handle = thread::spawn(move || {
-        run_db_worker(db_filename, db_rx, batch_size, track_matches, col_defs_for_db, db_worker_stats)
+        run_db_worker(db_filename, db_rx, batch_size, track_matches, col_defs_for_db, db_worker_stats, run_meta)
     });
 
     // Start Parsers
@@ -318,10 +335,8 @@ fn main() -> Result<()> {
     if cli.data_stdin {
         splicer.run_stream(io::stdin())?;
     } else {
-        // Collect various sources of paths
         let mut path_iterators: Vec<Box<dyn Iterator<Item = PathBuf> + Send>> = Vec::new();
 
-        // 1. CLI Arguments (Directories or Files)
         if !cli.inputs.is_empty() {
              for path in cli.inputs {
                  if path.is_dir() {
@@ -334,27 +349,20 @@ fn main() -> Result<()> {
                          .map(|e| e.path().to_path_buf());
                      path_iterators.push(Box::new(iter));
                  } else {
-                     // Single file
                      path_iterators.push(Box::new(std::iter::once(path)));
                  }
              }
         }
 
-        // 2. File list from stdin
         if cli.files_from_stdin {
-             let stdin_iter = io::stdin().lock().lines()
+             let paths: Vec<PathBuf> = io::stdin().lock().lines()
                  .filter_map(|l| l.ok())
                  .filter(|l| !l.trim().is_empty())
-                 .map(|l| PathBuf::from(l.trim()));
-             // Lines struct is not Send by default because it captures the Lock, 
-             // but we can collect to vec? Or implement custom iterator?
-             // Since stdin lock is not Send, we must collect unfortunately or use different mechanism.
-             // Collecting is safer for now.
-             let paths: Vec<PathBuf> = stdin_iter.collect();
+                 .map(|l| PathBuf::from(l.trim()))
+                 .collect();
              path_iterators.push(Box::new(paths.into_iter()));
         }
 
-        // 3. File list from file
         if let Some(list_path) = cli.file_list {
              let file = File::open(list_path).context("Cannot open file list")?;
              let buf = BufReader::new(file);
@@ -362,12 +370,9 @@ fn main() -> Result<()> {
                  .filter_map(|l| l.ok())
                  .filter(|l| !l.trim().is_empty())
                  .map(|l| PathBuf::from(l.trim()));
-             // Same issue with Lines iterator being Send? 
-             // std::io::Lines<BufReader<File>> IS Send.
              path_iterators.push(Box::new(file_iter));
         }
 
-        // Use the default "." if absolutely nothing provided?
         if path_iterators.is_empty() {
             println!("No input sources provided. Defaulting to scanning current directory.");
             let walker = WalkDir::new(".").max_depth(if cli.no_recursive { 1 } else { usize::MAX });
@@ -378,7 +383,6 @@ fn main() -> Result<()> {
             path_iterators.push(Box::new(iter));
         }
 
-        // Flatten all iterators into one
         let unified_iter = path_iterators.into_iter().flatten();
         splicer.run(unified_iter)?;
     }
@@ -387,7 +391,7 @@ fn main() -> Result<()> {
 
     for h in handles { h.join().unwrap(); }
     drop(db_tx);
-    db_handle.join().unwrap()?;
+    let run_id = db_handle.join().unwrap()?;
 
     // Final Stats
     let duration = start_time.elapsed().as_secs_f64();
@@ -402,6 +406,8 @@ fn main() -> Result<()> {
 
     println!("Done:  [Files: {} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Matches: {}] [DB Insert: {} ({:.0}/s)]", 
                 files, files_rate, mb_total, mb_rate, matches, commits, recs_rate);
+    println!("Run ID: {}", run_id);
+    println!("Data Table: data_{}", run_id);
 
     Ok(())
 }
@@ -412,8 +418,9 @@ fn run_db_worker(
     batch_size: usize,
     track_matches: bool,
     columns: Vec<String>,
-    stats: Arc<DbStats>
-) -> Result<()> {
+    stats: Arc<DbStats>,
+    meta: RunMetadata,
+) -> Result<i64> {
     let mut conn = Connection::open(path)?;
     
     conn.execute_batch("
@@ -421,17 +428,42 @@ fn run_db_worker(
         PRAGMA journal_mode = MEMORY;
     ")?;
 
+    // 1. Setup Runs Registry
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS runs (
+            id INTEGER PRIMARY KEY,
+            timestamp TEXT,
+            command TEXT,
+            regex TEXT
+        )", 
+        [],
+    )?;
+
+    // 2. Register this run
+    conn.execute(
+        "INSERT INTO runs (timestamp, command, regex) VALUES (?, ?, ?)",
+        params![meta.created_at, meta.command_args, meta.regex],
+    )?;
+    let run_id = conn.last_insert_rowid();
+
+    // 3. Setup Global Files Table
+    conn.execute("CREATE TABLE IF NOT EXISTS files (
+        id INTEGER PRIMARY KEY, 
+        path TEXT UNIQUE
+    )", [])?;
+
+    // 4. Setup Run-Specific Data Tables
+    let data_table_name = format!("data_{}", run_id);
+    let matches_table_name = format!("matches_{}", run_id);
+
     if track_matches {
-        conn.execute("CREATE TABLE IF NOT EXISTS files (
-            id INTEGER PRIMARY KEY, 
-            path TEXT UNIQUE
-        )", [])?;
-        conn.execute("CREATE TABLE IF NOT EXISTS matches (
+        let sql = format!("CREATE TABLE {} (
             id INTEGER PRIMARY KEY,
             file_id INTEGER,
             offset INTEGER,
             content TEXT
-        )", [])?;
+        )", matches_table_name);
+        conn.execute(&sql, [])?;
     }
 
     let mut col_defs = String::new();
@@ -442,8 +474,8 @@ fn run_db_worker(
     let match_id_col = if track_matches { ", match_id INTEGER" } else { "" };
     
     let create_sql = format!(
-        "CREATE TABLE IF NOT EXISTS data (id INTEGER PRIMARY KEY{}{})", 
-        match_id_col, col_defs
+        "CREATE TABLE {} (id INTEGER PRIMARY KEY{}{})", 
+        data_table_name, match_id_col, col_defs
     );
     conn.execute(&create_sql, [])?;
 
@@ -453,15 +485,15 @@ fn run_db_worker(
     while let Ok(msg) = rx.recv() {
         batch.push(msg);
         if batch.len() >= batch_size {
-            flush_batch(&mut conn, &mut batch, &mut file_cache, track_matches, &columns, &stats)?;
+            flush_batch(&mut conn, &mut batch, &mut file_cache, track_matches, &columns, &stats, &data_table_name, &matches_table_name)?;
         }
     }
     
     if !batch.is_empty() {
-        flush_batch(&mut conn, &mut batch, &mut file_cache, track_matches, &columns, &stats)?;
+        flush_batch(&mut conn, &mut batch, &mut file_cache, track_matches, &columns, &stats, &data_table_name, &matches_table_name)?;
     }
 
-    Ok(())
+    Ok(run_id)
 }
 
 fn flush_batch(
@@ -470,7 +502,9 @@ fn flush_batch(
     file_cache: &mut HashMap<PathBuf, i64>,
     track_matches: bool,
     columns: &[String],
-    stats: &Arc<DbStats>
+    stats: &Arc<DbStats>,
+    data_table: &str,
+    matches_table: &str,
 ) -> Result<()> {
     let tx = conn.transaction()?;
     
@@ -496,8 +530,9 @@ fn flush_batch(
                 0
             };
 
+            let sql = format!("INSERT INTO {} (file_id, offset, content) VALUES (?, ?, ?)", matches_table);
             tx.execute(
-                "INSERT INTO matches (file_id, offset, content) VALUES (?, ?, ?)",
+                &sql,
                 params![file_id, offset as i64, line_content],
             )?;
             current_match_id = Some(tx.last_insert_rowid());
@@ -520,7 +555,7 @@ fn flush_batch(
         let match_col = if track_matches { "match_id, " } else { "" };
         let col_names = columns.join(", ");
         
-        let sql = format!("INSERT INTO data ({}{}) VALUES ({})", match_col, col_names, place_holders);
+        let sql = format!("INSERT INTO {} ({}{}) VALUES ({})", data_table, match_col, col_names, place_holders);
         
         let params_refs: Vec<&dyn rusqlite::ToSql> = values.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
         tx.execute(&sql, &*params_refs)?;
