@@ -169,9 +169,12 @@ impl IoSplicer {
         }
     }
 
+    // OPTIMIZED PROCESS READER
     fn process_reader<R: Read>(&self, mut reader: R) -> Result<()> {
+        // Pre-allocate the full buffer to avoid reallocations
         let mut buffer = Vec::with_capacity(self.config.max_buffer_size);
-        let mut read_buf = vec![0u8; 64 * 1024];
+        // Larger read buffer (128KB) for fewer syscalls
+        let mut read_buf = vec![0u8; 128 * 1024]; 
 
         loop {
             let bytes_read = reader.read(&mut read_buf)?;
@@ -182,25 +185,41 @@ impl IoSplicer {
             self.stats.byte_count.fetch_add(bytes_read, Ordering::Relaxed);
             buffer.extend_from_slice(&read_buf[..bytes_read]);
 
+            // Only attempt to splice if we have enough data (chunk_size) or if we hit the hard limit (max_buffer_size)
             while buffer.len() >= self.config.chunk_size {
-                let window_limit = std::cmp::min(buffer.len(), self.config.max_buffer_size);
-                let window = &buffer[..window_limit];
-
-                if let Some(last_newline_pos) = window.iter().rposition(|&b| b == b'\n') {
-                    let split_idx = last_newline_pos + 1;
-                    self.emit_chunk(&buffer[..split_idx])?;
-                    buffer.drain(..split_idx);
+                // Determine the search window. 
+                // We want to scan the LARGEST valid chunk possible (up to max_buffer_size)
+                // to minimize the number of small chunks and drain operations.
+                let search_limit = std::cmp::min(buffer.len(), self.config.max_buffer_size);
+                
+                // Search backwards from the end of the allowable window
+                let slice_to_check = &buffer[..search_limit];
+                
+                if let Some(last_newline_idx) = slice_to_check.iter().rposition(|&b| b == b'\n') {
+                    // We found a newline. The chunk is everything up to and including it.
+                    let split_len = last_newline_idx + 1;
+                    
+                    self.emit_chunk(&buffer[..split_len])?;
+                    
+                    // Remove the processed chunk. The remainder (tail) is shifted to start.
+                    // This drain is O(N) on the remainder size, so it's efficient if split_len is large.
+                    buffer.drain(..split_len);
                 } else {
+                    // No newline found in the window.
                     if buffer.len() >= self.config.max_buffer_size {
+                        // Buffer is full and no newline. Force split.
                         self.emit_chunk(&buffer[..self.config.max_buffer_size])?;
                         buffer.drain(..self.config.max_buffer_size);
                     } else {
+                        // We haven't hit max size yet, so we can read more data 
+                        // hoping for a newline to appear later.
                         break;
                     }
                 }
             }
         }
 
+        // Flush remainder at EOF
         if !buffer.is_empty() {
             self.emit_chunk(&buffer)?;
         }

@@ -1,37 +1,68 @@
 use anyhow::{Context, Result};
+use clap::Parser;
 use crossbeam_channel::bounded;
 use dashmap::DashMap;
 use io_splicer_demo::{InputSource, IoSplicer, SplicerConfig, SplicerStats};
 use regex::Regex;
-use std::env;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    /// Target directory to scan
+    #[arg(default_value = ".")]
+    target_dir: PathBuf,
+
+    /// Optional Regex filter for file names (e.g., ".*\.java")
+    #[arg(short = 'f', long = "filter")]
+    filter_pattern: Option<String>,
+
+    /// Number of threads for the splicer (IO/Decompression) pool.
+    /// Defaults to 50% of available cores.
+    #[arg(short = 's', long = "splicers")]
+    splicer_threads: Option<usize>,
+
+    /// Number of threads for the parser (Word Count) pool.
+    /// Defaults to 50% of available cores.
+    #[arg(short = 'p', long = "parsers")]
+    parser_threads: Option<usize>,
+}
+
 fn main() -> Result<()> {
-    // 1. Setup
-    let args: Vec<String> = env::args().collect();
-    let target_dir = args.get(1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    
-    let filter_arg = args.get(2).cloned();
-    let path_filter = if let Some(pattern) = filter_arg {
+    let cli = Cli::parse();
+
+    // 1. Setup Filters
+    let path_filter = if let Some(pattern) = cli.filter_pattern {
         println!("Filter: {}", pattern);
-        Some(Regex::new(&pattern).context("Invalid regex")?)
+        Some(Regex::new(&pattern).context("Invalid regex provided")?)
     } else {
         None
     };
 
     // 2. Resource Allocation
     let total_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    // 50/50 split between Splicing (IO/Decompression) and Parsing (CPU/Hashing)
-    let splicer_threads = std::cmp::max(1, total_cores / 2);
-    let parser_threads = std::cmp::max(1, total_cores - splicer_threads);
+    
+    // Default strategy: 50/50 split
+    let default_splicer = std::cmp::max(1, total_cores / 2);
+    let default_parser = std::cmp::max(1, total_cores.saturating_sub(default_splicer));
 
-    println!("Configuration: {} Total Cores", total_cores);
-    println!("  - Splicer Pool: {} threads", splicer_threads);
-    println!("  - Parser Pool:  {} threads", parser_threads);
+    // Apply overrides if provided
+    let splicer_threads = cli.splicer_threads.unwrap_or(default_splicer);
+    let parser_threads = cli.parser_threads.unwrap_or(default_parser);
+
+    println!("Configuration: {} Total Cores Available", total_cores);
+    println!("  - Splicer Pool: {} threads {}", 
+        splicer_threads, 
+        if cli.splicer_threads.is_some() { "(Manual)" } else { "(Auto)" }
+    );
+    println!("  - Parser Pool:  {} threads {}", 
+        parser_threads, 
+        if cli.parser_threads.is_some() { "(Manual)" } else { "(Auto)" }
+    );
 
     let config = SplicerConfig {
         chunk_size: 256 * 1024,
@@ -57,7 +88,7 @@ fn main() -> Result<()> {
         let mut last_bytes = 0;
         loop {
             thread::sleep(Duration::from_secs(1));
-            let elapsed = start.elapsed().as_secs_f64();
+            // let elapsed = start.elapsed().as_secs_f64();
             let files = stats_monitor.file_count.load(Ordering::Relaxed);
             let bytes = stats_monitor.byte_count.load(Ordering::Relaxed);
             
@@ -94,11 +125,11 @@ fn main() -> Result<()> {
     }
 
     // 5. Run Splicer
-    println!("Starting scan on {:?}...", target_dir);
+    println!("Starting scan on {:?}...", cli.target_dir);
     let start_time = std::time::Instant::now();
     let splicer = IoSplicer::new(config, stats.clone(), tx);
     
-    if let Err(e) = splicer.run(InputSource::Directory(target_dir)) {
+    if let Err(e) = splicer.run(InputSource::Directory(cli.target_dir)) {
         eprintln!("Splicer Error: {:?}", e);
     }
     drop(splicer); // EOF signal
