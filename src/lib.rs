@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use walkdir::WalkDir;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
 #[derive(Clone, Debug)]
@@ -17,7 +16,6 @@ pub struct SplicerConfig {
     pub chunk_size: usize,
     pub max_buffer_size: usize,
     pub path_filter: Option<Regex>,
-    pub recursive: bool,
     pub thread_count: usize,
 }
 
@@ -27,7 +25,6 @@ impl Default for SplicerConfig {
             chunk_size: 256 * 1024,
             max_buffer_size: 2 * 1024 * 1024,
             path_filter: None,
-            recursive: true,
             thread_count: 0,
         }
     }
@@ -46,19 +43,13 @@ pub struct SplicerStats {
     pub forced_split_count: AtomicUsize,
 }
 
-/// The payload sent to workers. Contains the raw data and metadata.
 pub struct SplicedChunk {
     pub data: Vec<u8>,
     pub file_path: Option<Arc<PathBuf>>,
-    /// Byte offset where this chunk starts in the file
     pub offset: u64,
 }
 
-pub enum InputSource {
-    Stdin,
-    FileList(Vec<PathBuf>),
-    Directory(PathBuf),
-}
+// Deprecated: Removed InputSource enum in favor of generic iterator
 
 pub struct IoSplicer {
     config: SplicerConfig,
@@ -82,44 +73,13 @@ impl IoSplicer {
         }
     }
 
-    pub fn run(&self, input: InputSource) -> Result<()> {
-        match input {
-            InputSource::Stdin => {
-                let stdin = io::stdin();
-                self.process_reader(stdin.lock(), None)?;
-            }
-            InputSource::FileList(paths) => {
-                self.run_parallel_splicers(paths.into_iter())?;
-            }
-            InputSource::Directory(root) => {
-                let config = self.config.clone();
-                let walker = WalkDir::new(&root).max_depth(if config.recursive { usize::MAX } else { 1 });
-
-                let path_iter = walker
-                    .into_iter()
-                    .filter_map(move |e| e.ok())
-                    .filter(move |e| {
-                        if !e.file_type().is_file() {
-                            return false;
-                        }
-                        if let Some(re) = &config.path_filter {
-                            if let Some(s) = e.path().to_str() {
-                                if !re.is_match(s) {
-                                    return false;
-                                }
-                            }
-                        }
-                        true
-                    })
-                    .map(|e| e.path().to_path_buf());
-
-                self.run_parallel_splicers(path_iter)?;
-            }
-        }
-        Ok(())
+    /// Process a stream of data from a Reader (like Stdin)
+    pub fn run_stream<R: Read + Send>(&self, reader: R) -> Result<()> {
+        self.process_reader(reader, None)
     }
 
-    fn run_parallel_splicers<I>(&self, path_iter: I) -> Result<()>
+    /// Process a stream of file paths
+    pub fn run<I>(&self, path_iter: I) -> Result<()>
     where
         I: Iterator<Item = PathBuf> + Send,
     {
@@ -129,8 +89,21 @@ impl IoSplicer {
         thread::scope(|s| {
             s.spawn(move || {
                 for path in path_iter {
-                    self.stats.paths_queued.fetch_add(1, Ordering::Relaxed);
-                    if path_tx.send(path).is_err() { break; }
+                    // Check filter before queueing (optimization)
+                    let matches_filter = if let Some(re) = &self.config.path_filter {
+                        if let Some(s) = path.to_str() {
+                            re.is_match(s)
+                        } else {
+                            false
+                        }
+                    } else {
+                        true
+                    };
+
+                    if matches_filter {
+                        self.stats.paths_queued.fetch_add(1, Ordering::Relaxed);
+                        if path_tx.send(path).is_err() { break; }
+                    }
                 }
             });
 
@@ -158,7 +131,6 @@ impl IoSplicer {
         self.stats.file_count.fetch_add(1, Ordering::Relaxed);
         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
         
-        // Wrap path in Arc for cheap sharing with chunks
         let path_arc = Some(Arc::new(path.to_path_buf()));
 
         match ext {

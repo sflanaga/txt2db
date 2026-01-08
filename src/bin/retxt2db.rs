@@ -1,39 +1,47 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::{bounded, Receiver};
-use io_splicer_demo::{InputSource, IoSplicer, SplicedChunk, SplicerConfig, SplicerStats};
+use io_splicer_demo::{IoSplicer, SplicedChunk, SplicerConfig, SplicerStats};
 use regex::Regex;
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
-use std::io::{self, BufRead};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use walkdir::WalkDir;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Cli {
-    /// Target directory to scan (optional if --stdin used)
-    #[arg(default_value = ".")]
-    target_dir: PathBuf,
+    /// Files or directories to scan. If directories, they are walked recursively.
+    #[arg(value_name = "INPUTS")]
+    inputs: Vec<PathBuf>,
 
-    /// Read list of files from Stdin instead of walking a directory
-    #[arg(long = "stdin")]
-    read_stdin_files: bool,
+    /// Read list of files from Stdin.
+    #[arg(long = "files-from-stdin")]
+    files_from_stdin: bool,
+
+    /// Read file list from a specific file.
+    #[arg(long = "file-list")]
+    file_list: Option<PathBuf>,
+
+    /// Read content DATA directly from Stdin (no filename).
+    #[arg(long = "data-stdin")]
+    data_stdin: bool,
 
     /// Regular Expression to parse lines
     #[arg(short = 'r', long = "regex")]
     regex: String,
 
     /// Optional: Regular Expression to parse File Paths. 
-    /// If provided, files not matching this regex are ignored.
     #[arg(long = "path-regex")]
     path_regex: Option<String>,
 
     /// File path filter (regex) for directory walking. 
-    /// (Distinct from --path-regex, which extracts fields)
     #[arg(short = 'f', long = "filter")]
     filter_pattern: Option<String>,
 
@@ -41,25 +49,18 @@ struct Cli {
     #[arg(long = "no-recursive")]
     no_recursive: bool,
 
-    /// Database output file. Defaults to scan_HHMMSS.db
     #[arg(long)]
     db_path: Option<String>,
 
-    /// Field mapping (e.g., "p1:host;l1:date"). 
-    /// Prefixes: 'p' for path capture groups, 'l' for line capture groups.
-    /// If omitted, defaults to pf_N (path) and lf_N (line) or f_N.
     #[arg(short = 'F', long = "fields")]
     field_map: Option<String>,
 
-    /// Enable optional tracking tables (files, matches)
     #[arg(long)]
     track_matches: bool,
 
-    /// Batch size for DB inserts
     #[arg(long, default_value = "1000")]
     batch_size: usize,
 
-    /// Stats ticker interval in milliseconds
     #[arg(long = "ticker", default_value_t = 1000)]
     ticker_interval: u64,
 
@@ -70,7 +71,6 @@ struct Cli {
     parser_threads: Option<usize>,
 }
 
-/// Helper to define where a DB column gets its data
 #[derive(Clone, Debug)]
 enum FieldSource {
     Path(usize),
@@ -101,38 +101,18 @@ struct DbStats {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    
-    // 1. Setup Input Source
-    let input_source = if cli.read_stdin_files {
-        let mut files = Vec::new();
-        let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            if let Ok(l) = line {
-                if !l.trim().is_empty() {
-                    files.push(PathBuf::from(l.trim()));
-                }
-            }
-        }
-        println!("Loaded {} files from stdin.", files.len());
-        InputSource::FileList(files)
-    } else {
-        InputSource::Directory(cli.target_dir)
-    };
 
-    // 2. Setup Regexes
+    // Setup Regexes
     let line_re = Regex::new(&cli.regex).context("Invalid Line Regex")?;
-    
     let path_re = if let Some(pr) = &cli.path_regex {
         Some(Regex::new(pr).context("Invalid Path Regex")?)
     } else {
         None
     };
 
-    // 3. Setup Field Mapping
+    // Setup Field Mapping
     let mut columns = Vec::new();
-
     if let Some(map_str) = &cli.field_map {
-        // Custom Mapping: "p1:host;l1:date"
         for part in map_str.split(';') {
             let kv: Vec<&str> = part.split(':').collect();
             if kv.len() == 2 {
@@ -152,7 +132,6 @@ fn main() -> Result<()> {
             }
         }
     } else {
-        // Default Auto-Mapping
         if let Some(pre) = &path_re {
             for i in 1..pre.captures_len() {
                 columns.push(ColumnDef { name: format!("pf_{}", i), source: FieldSource::Path(i) });
@@ -174,7 +153,7 @@ fn main() -> Result<()> {
         }
     }
 
-    // 4. Filename Logic
+    // Filename Logic
     let db_filename = cli.db_path.clone().unwrap_or_else(|| {
         let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let seconds_in_day = secs % 86400;
@@ -199,7 +178,6 @@ fn main() -> Result<()> {
         chunk_size: 256 * 1024,
         max_buffer_size: 1024 * 1024,
         path_filter, 
-        recursive: !cli.no_recursive,
         thread_count: splicer_count,
     };
 
@@ -239,27 +217,26 @@ fn main() -> Result<()> {
 
             let mb_total = bytes as f64 / 1024.0 / 1024.0;
             let mb_rate = bytes_d as f64 / 1024.0 / 1024.0;
-            // Adjust rate display based on ticker interval (normalize to per second)
             let rate_factor = 1000.0 / tick_duration.as_millis() as f64;
             let display_mb_rate = mb_rate * rate_factor;
             let display_files_rate = files_d as f64 * rate_factor;
             let display_recs_rate = recs_d as f64 * rate_factor;
-
 
             println!("Stats: [Files: {} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Matches: {}] [DB Insert: {} ({:.0}/s)]", 
                 files, display_files_rate, mb_total, display_mb_rate, matches, commits, display_recs_rate);
         }
     });
 
+    // Start DB Worker
     let batch_size = cli.batch_size;
     let track_matches = cli.track_matches;
     let col_defs_for_db = columns.iter().map(|c| c.name.clone()).collect();
     let db_worker_stats = db_stats.clone();
-    
     let db_handle = thread::spawn(move || {
         run_db_worker(db_filename, db_rx, batch_size, track_matches, col_defs_for_db, db_worker_stats)
     });
 
+    // Start Parsers
     let mut handles = vec![];
     for _ in 0..parser_count {
         let rx = splicer_rx.clone();
@@ -273,8 +250,6 @@ fn main() -> Result<()> {
         handles.push(thread::spawn(move || {
             while let Ok(chunk) = rx.recv() {
                 let mut data = chunk.data;
-                
-                // Track bytes
                 t_stats.bytes_processed.fetch_add(data.len(), Ordering::Relaxed);
 
                 let path_arc = chunk.file_path;
@@ -283,12 +258,10 @@ fn main() -> Result<()> {
                 let mut should_process = true;
                 let mut path_fields = Vec::with_capacity(thread_columns.len());
 
-                // Path Extraction
                 if let Some(pre) = &thread_path_re {
                     if let Some(p) = &path_arc {
                         let p_str = p.to_string_lossy();
                         if let Some(caps) = pre.captures(&p_str) {
-                             // Extract only if we need path fields
                              for col in &thread_columns {
                                  if let FieldSource::Path(idx) = col.source {
                                      let val = caps.get(idx).map(|m| m.as_str().to_string()).unwrap_or_default();
@@ -305,7 +278,6 @@ fn main() -> Result<()> {
 
                 if should_process {
                     let s = String::from_utf8_lossy(&data);
-                    
                     for capture in thread_line_re.captures_iter(&s) {
                         t_stats.matched_lines.fetch_add(1, Ordering::Relaxed);
                         
@@ -313,33 +285,26 @@ fn main() -> Result<()> {
                         let match_offset = chunk_offset + capture.get(0).map(|m| m.start()).unwrap_or(0) as u64;
 
                         let mut fields = Vec::with_capacity(thread_columns.len());
-                        
                         for col in &thread_columns {
                             match col.source {
                                 FieldSource::Line(idx) => {
                                     fields.push(capture.get(idx).map(|m| m.as_str().to_string()));
                                 },
                                 FieldSource::Path(idx) => {
-                                    // Optimization: Find from path_fieldsvec (small linear scan is fine)
-                                    // or rebuild logic slightly to store better map?
-                                    // Since we just populated path_fields as (idx, val), let's find it.
                                     let val = path_fields.iter().find(|(k, _)| *k == idx).map(|(_, v)| v.clone());
                                     fields.push(val);
                                 }
                             }
                         }
-
                         let record = DbRecord::Data {
                             file_path: path_arc.clone(),
                             offset: match_offset,
                             line_content: full_match,
                             fields,
                         };
-                        
                         if d_tx.send(record).is_err() { break; }
                     }
                 }
-
                 data.clear();
                 let _ = r_tx.send(data);
             }
@@ -348,11 +313,79 @@ fn main() -> Result<()> {
 
     println!("Starting DB Ingestion Scan...");
     let splicer = IoSplicer::new(config, splicer_stats.clone(), splicer_tx, recycle_rx);
-    splicer.run(input_source)?;
+
+    // --- Input Aggregation Logic ---
+    if cli.data_stdin {
+        splicer.run_stream(io::stdin())?;
+    } else {
+        // Collect various sources of paths
+        let mut path_iterators: Vec<Box<dyn Iterator<Item = PathBuf> + Send>> = Vec::new();
+
+        // 1. CLI Arguments (Directories or Files)
+        if !cli.inputs.is_empty() {
+             for path in cli.inputs {
+                 if path.is_dir() {
+                     let recursive = !cli.no_recursive;
+                     let max_depth = if recursive { usize::MAX } else { 1 };
+                     let walker = WalkDir::new(path).max_depth(max_depth);
+                     let iter = walker.into_iter()
+                         .filter_map(|e| e.ok())
+                         .filter(|e| e.file_type().is_file())
+                         .map(|e| e.path().to_path_buf());
+                     path_iterators.push(Box::new(iter));
+                 } else {
+                     // Single file
+                     path_iterators.push(Box::new(std::iter::once(path)));
+                 }
+             }
+        }
+
+        // 2. File list from stdin
+        if cli.files_from_stdin {
+             let stdin_iter = io::stdin().lock().lines()
+                 .filter_map(|l| l.ok())
+                 .filter(|l| !l.trim().is_empty())
+                 .map(|l| PathBuf::from(l.trim()));
+             // Lines struct is not Send by default because it captures the Lock, 
+             // but we can collect to vec? Or implement custom iterator?
+             // Since stdin lock is not Send, we must collect unfortunately or use different mechanism.
+             // Collecting is safer for now.
+             let paths: Vec<PathBuf> = stdin_iter.collect();
+             path_iterators.push(Box::new(paths.into_iter()));
+        }
+
+        // 3. File list from file
+        if let Some(list_path) = cli.file_list {
+             let file = File::open(list_path).context("Cannot open file list")?;
+             let buf = BufReader::new(file);
+             let file_iter = buf.lines()
+                 .filter_map(|l| l.ok())
+                 .filter(|l| !l.trim().is_empty())
+                 .map(|l| PathBuf::from(l.trim()));
+             // Same issue with Lines iterator being Send? 
+             // std::io::Lines<BufReader<File>> IS Send.
+             path_iterators.push(Box::new(file_iter));
+        }
+
+        // Use the default "." if absolutely nothing provided?
+        if path_iterators.is_empty() {
+            println!("No input sources provided. Defaulting to scanning current directory.");
+            let walker = WalkDir::new(".").max_depth(if cli.no_recursive { 1 } else { usize::MAX });
+            let iter = walker.into_iter()
+                 .filter_map(|e| e.ok())
+                 .filter(|e| e.file_type().is_file())
+                 .map(|e| e.path().to_path_buf());
+            path_iterators.push(Box::new(iter));
+        }
+
+        // Flatten all iterators into one
+        let unified_iter = path_iterators.into_iter().flatten();
+        splicer.run(unified_iter)?;
+    }
+
     drop(splicer);
 
     for h in handles { h.join().unwrap(); }
-    
     drop(db_tx);
     db_handle.join().unwrap()?;
 

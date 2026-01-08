@@ -2,13 +2,14 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::bounded;
 use dashmap::DashMap;
-use io_splicer_demo::{InputSource, IoSplicer, SplicedChunk, SplicerConfig, SplicerStats};
+use io_splicer_demo::{IoSplicer, SplicedChunk, SplicerConfig, SplicerStats};
 use regex::Regex;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use walkdir::WalkDir;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -33,7 +34,6 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let path_filter = if let Some(pattern) = cli.filter_pattern {
-        println!("Filter: {}", pattern);
         Some(Regex::new(&pattern).context("Invalid regex provided")?)
     } else {
         None
@@ -47,7 +47,6 @@ fn main() -> Result<()> {
         chunk_size: 256 * 1024,
         max_buffer_size: 1024 * 1024,
         path_filter,
-        recursive: true,
         thread_count: splicer_count,
     };
 
@@ -55,7 +54,6 @@ fn main() -> Result<()> {
     let search_counts = Arc::new(DashMap::new());
     let stats = Arc::new(SplicerStats::default());
     
-    // UPDATED: Channel now carries SplicedChunk
     let (tx, rx) = bounded::<SplicedChunk>(256); 
     let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(512);
 
@@ -98,13 +96,11 @@ fn main() -> Result<()> {
         let term = search_term.clone();
 
         handles.push(thread::spawn(move || {
-            // UPDATED: Deconstruct the chunk to get data
             while let Ok(chunk) = rx_worker.recv() {
                 let mut data = chunk.data;
                 
                 {
                     let chunk_str = String::from_utf8_lossy(&data);
-                    
                     if let Some(t) = &term {
                         let count = chunk_str.matches(t).count();
                         if count > 0 {
@@ -120,7 +116,6 @@ fn main() -> Result<()> {
                     }
                 } 
                 
-                // UPDATED: Recycle the raw Vec<u8> only
                 data.clear();
                 let _ = recycle_worker.send(data);
             }
@@ -129,7 +124,15 @@ fn main() -> Result<()> {
 
     println!("Starting scan on {:?}...", cli.target_dir);
     let splicer = IoSplicer::new(config, stats.clone(), tx, recycle_rx);
-    if let Err(e) = splicer.run(InputSource::Directory(cli.target_dir)) {
+
+    // Manual WalkDir since IoSplicer is now generic
+    let walker = WalkDir::new(&cli.target_dir);
+    let iter = walker.into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.path().to_path_buf());
+
+    if let Err(e) = splicer.run(iter) {
         eprintln!("Splicer Error: {:?}", e);
     }
     drop(splicer);
