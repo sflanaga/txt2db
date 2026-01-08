@@ -39,6 +39,16 @@ pub struct SplicerStats {
     pub byte_count: AtomicUsize,
     pub chunk_count: AtomicUsize,
     pub paths_queued: AtomicIsize,
+    
+    // --- NEW METRICS ---
+    /// Count of times we had to allocate a NEW buffer (Recycler Empty)
+    pub recycler_miss_count: AtomicUsize,
+    /// Count of times we had to grow/reallocate a buffer (Recycled buffer too small)
+    pub buffer_realloc_count: AtomicUsize,
+    /// Count of actual newline splits performed
+    pub newline_split_count: AtomicUsize,
+    /// Count of splits forced by buffer overflow (no newline found)
+    pub forced_split_count: AtomicUsize,
 }
 
 pub enum InputSource {
@@ -50,9 +60,7 @@ pub enum InputSource {
 pub struct IoSplicer {
     config: SplicerConfig,
     stats: Arc<SplicerStats>,
-    // We now send raw byte vectors instead of Strings
     sender: Sender<Vec<u8>>,
-    // New: Receive recycled buffers from workers
     recycler: Receiver<Vec<u8>>,
 }
 
@@ -181,11 +189,17 @@ impl IoSplicer {
                 let slice_to_check = &buffer[..search_limit];
                 
                 if let Some(last_newline_idx) = slice_to_check.iter().rposition(|&b| b == b'\n') {
+                    // NEW METRIC: We successfully found a newline and are splitting on it
+                    self.stats.newline_split_count.fetch_add(1, Ordering::Relaxed);
+                    
                     let split_len = last_newline_idx + 1;
                     self.emit_chunk(&buffer[..split_len])?;
                     buffer.drain(..split_len);
                 } else {
                     if buffer.len() >= self.config.max_buffer_size {
+                        // NEW METRIC: Forced split (no newline)
+                        self.stats.forced_split_count.fetch_add(1, Ordering::Relaxed);
+                        
                         self.emit_chunk(&buffer[..self.config.max_buffer_size])?;
                         buffer.drain(..self.config.max_buffer_size);
                     } else {
@@ -203,13 +217,24 @@ impl IoSplicer {
     }
 
     fn emit_chunk(&self, bytes: &[u8]) -> Result<()> {
-        // --- OBJECT POOLING / RECYCLING ---
-        // Try to get a buffer from the recycle channel.
-        // If empty, allocate a new one.
-        let mut v = self.recycler.try_recv().unwrap_or_else(|_| Vec::with_capacity(bytes.len()));
-        
-        // Reset and fill
-        v.clear();
+        let mut v = match self.recycler.try_recv() {
+            Ok(mut b) => {
+                b.clear();
+                b
+            },
+            Err(_) => {
+                // NEW METRIC: Recycler was empty, had to alloc new
+                self.stats.recycler_miss_count.fetch_add(1, Ordering::Relaxed);
+                Vec::with_capacity(bytes.len())
+            }
+        };
+
+        // NEW METRIC: Check if we need to expand the buffer (realloc)
+        // If capacity < needed, Vec will realloc
+        if v.capacity() < bytes.len() {
+            self.stats.buffer_realloc_count.fetch_add(1, Ordering::Relaxed);
+        }
+
         v.extend_from_slice(bytes);
         
         self.sender.send(v).context("Receiver dropped")?;

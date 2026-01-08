@@ -24,8 +24,7 @@ struct Cli {
 
     #[arg(short = 'p', long = "parsers")]
     parser_threads: Option<usize>,
-    
-    /// Optional search term to count instead of all words
+
     #[arg(short = 'q', long = "search")]
     search_term: Option<String>,
 }
@@ -63,10 +62,7 @@ fn main() -> Result<()> {
     let stats = Arc::new(SplicerStats::default());
     
     // 2. Setup CHANNELS
-    // The main channel carries data (Vec<u8>)
     let (tx, rx) = bounded::<Vec<u8>>(256); 
-    
-    // The recycle channel carries empty buffers back to the Splicer
     let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(512);
 
     // 3. Stats Monitor
@@ -76,7 +72,7 @@ fn main() -> Result<()> {
 
     thread::spawn(move || {
         let mut last_bytes = 0;
-        let mut last_files = 0; // Track previous file count
+        let mut last_files = 0;
 
         loop {
             thread::sleep(Duration::from_secs(1));
@@ -90,7 +86,7 @@ fn main() -> Result<()> {
             
             let mb_total = bytes as f64 / 1024.0 / 1024.0;
             let mb_diff = (bytes - last_bytes) as f64 / 1024.0 / 1024.0;
-            let files_diff = files - last_files; // Files per second
+            let files_diff = files - last_files;
             
             last_bytes = bytes;
             last_files = files;
@@ -119,13 +115,11 @@ fn main() -> Result<()> {
                 let chunk_str = String::from_utf8_lossy(&chunk_vec);
                 
                 if let Some(t) = &term {
-                    // Search Mode
                     let count = chunk_str.matches(t).count();
                     if count > 0 {
                         *search_map.entry(t.clone()).or_insert(0) += count;
                     }
                 } else {
-                    // Word Count Mode
                     for word in chunk_str.split_whitespace() {
                         let w = word.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
                         if !w.is_empty() {
@@ -133,8 +127,6 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                
-                // Recycle buffer
                 drop(chunk_str); 
                 let _ = recycle_worker.send(chunk_vec);
             }
@@ -162,16 +154,29 @@ fn main() -> Result<()> {
     let final_files = stats.file_count.load(Ordering::Relaxed);
     let final_bytes = stats.byte_count.load(Ordering::Relaxed);
     let final_chunks = stats.chunk_count.load(Ordering::Relaxed);
+    
+    let recycler_miss = stats.recycler_miss_count.load(Ordering::Relaxed);
+    let buffer_realloc = stats.buffer_realloc_count.load(Ordering::Relaxed);
+    let newline_splits = stats.newline_split_count.load(Ordering::Relaxed);
+    let forced_splits = stats.forced_split_count.load(Ordering::Relaxed);
+
     let mb = final_bytes as f64 / 1024.0 / 1024.0;
     let seconds = duration.as_secs_f64();
 
     println!("\n================ FINAL STATS ================");
     println!("Duration:       {:.2} seconds", seconds);
     println!("Total Files:    {}", final_files);
-    println!("Total Chunks:   {}", final_chunks);
     println!("Total Size:     {:.2} MB", mb);
     println!("Avg Throughput: {:.2} MB/s", if seconds > 0.0 { mb / seconds } else { 0.0 });
-    
+    println!("Total Chunks:   {}", final_chunks);
+    println!("---------------------------------------------");
+    println!("Memory & Splicing Metrics:");
+    println!("  New Buffer Allocs: {}", recycler_miss);
+    println!("  Buffer Reallocs:   {}", buffer_realloc);
+    println!("  Newline Splits:    {}", newline_splits);
+    println!("  Forced Splits:     {}", forced_splits);
+    println!("=============================================");
+
     if let Some(t) = cli.search_term {
          let c = search_counts.get(&t).map(|v| *v).unwrap_or(0);
          println!("Term '{}':      {}", t, c);
@@ -184,7 +189,6 @@ fn main() -> Result<()> {
              println!("{}. {}: {}", i + 1, w, c);
          }
     }
-    println!("=============================================");
 
     Ok(())
 }
