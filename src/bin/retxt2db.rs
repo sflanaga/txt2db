@@ -312,11 +312,31 @@ fn main() -> Result<()> {
 
                 if should_process {
                     let s = String::from_utf8_lossy(&data);
+                    
                     for capture in thread_line_re.captures_iter(&s) {
                         t_stats.matched_lines.fetch_add(1, Ordering::Relaxed);
                         
-                        let full_match = capture.get(0).map(|m| m.as_str()).unwrap_or("").to_string();
-                        let match_offset = chunk_offset + capture.get(0).map(|m| m.start()).unwrap_or(0) as u64;
+                        // Extract Full Line Logic
+                        let match_start = capture.get(0).map(|m| m.start()).unwrap_or(0);
+                        let match_end = capture.get(0).map(|m| m.end()).unwrap_or(0);
+                        let bytes = s.as_bytes();
+
+                        // Scan backward for newline
+                        let start_idx = bytes[..match_start]
+                            .iter()
+                            .rposition(|&b| b == b'\n')
+                            .map(|i| i + 1)
+                            .unwrap_or(0);
+
+                        // Scan forward for newline
+                        let end_idx = bytes[match_end..]
+                            .iter()
+                            .position(|&b| b == b'\n')
+                            .map(|i| match_end + i)
+                            .unwrap_or(bytes.len());
+
+                        let full_line = s[start_idx..end_idx].trim_end().to_string();
+                        let match_offset = chunk_offset + start_idx as u64;
 
                         let mut fields = Vec::with_capacity(thread_columns.len());
                         for col in &thread_columns {
@@ -333,7 +353,7 @@ fn main() -> Result<()> {
                         let record = DbRecord::Data {
                             file_path: path_arc.clone(),
                             offset: match_offset,
-                            line_content: full_match,
+                            line_content: full_line,
                             fields,
                         };
                         if d_tx.send(record).is_err() { break; }
@@ -372,11 +392,11 @@ fn main() -> Result<()> {
         }
 
         if cli.files_from_stdin {
-             let paths: Vec<PathBuf> = io::stdin().lock().lines()
+             let stdin_iter = io::stdin().lock().lines()
                  .filter_map(|l| l.ok())
                  .filter(|l| !l.trim().is_empty())
-                 .map(|l| PathBuf::from(l.trim()))
-                 .collect();
+                 .map(|l| PathBuf::from(l.trim()));
+             let paths: Vec<PathBuf> = stdin_iter.collect();
              path_iterators.push(Box::new(paths.into_iter()));
         }
 
@@ -464,9 +484,6 @@ fn run_db_worker(
     let run_id = conn.last_insert_rowid();
 
     // 3. Setup Global Files Table (Now with run_id)
-    // We add run_id to schema. Note: If database exists from previous version (only id, path),
-    // we need to handle it. For now, assuming fresh DB or compatible schema.
-    // Ideally we would ALTER TABLE.
     let _ = conn.execute("ALTER TABLE files ADD COLUMN run_id INTEGER", []);
 
     conn.execute("CREATE TABLE IF NOT EXISTS files (
@@ -475,7 +492,6 @@ fn run_db_worker(
         path TEXT
     )", [])?;
 
-    // Create Index for (run_id, path) to allow efficient duplicate checking per run
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_run_path ON files(run_id, path)", [])?;
 
     // 4. Setup Run-Specific Data Tables
@@ -499,7 +515,6 @@ fn run_db_worker(
     
     let match_id_col = if track_matches { ", match_id INTEGER" } else { "" };
     
-    // Data Table: now includes run_id and file_id
     let create_sql = format!(
         "CREATE TABLE {} (id INTEGER PRIMARY KEY, run_id INTEGER, file_id INTEGER{}{})", 
         data_table_name, match_id_col, col_defs
@@ -547,13 +562,11 @@ fn flush_batch(
                 id
             } else {
                 let path_str = p.to_string_lossy();
-                // Insert with run_id. No conflict with other runs.
                 tx.execute(
                     "INSERT OR IGNORE INTO files (run_id, path) VALUES (?, ?)", 
                     params![run_id, path_str]
                 )?;
                 
-                // Retrieve ID (scoped to this run_id for safety, though path is enough if unique per run)
                 let mut stmt = tx.prepare("SELECT id FROM files WHERE run_id = ? AND path = ?")?;
                 let id: i64 = stmt.query_row(params![run_id, path_str], |row| row.get(0))?;
                 
@@ -561,7 +574,7 @@ fn flush_batch(
                 id
             }
         } else {
-            0 // 0 means Stdin/Unknown
+            0 
         };
 
         if track_matches {
@@ -576,7 +589,6 @@ fn flush_batch(
         let mut place_holders = String::new();
         let mut values: Vec<String> = Vec::new();
         
-        // Add run_id and file_id first
         place_holders.push_str("?, ?, ");
         values.push(run_id.to_string());
         values.push(file_id.to_string());
