@@ -6,7 +6,7 @@ use regex::Regex;
 use rusqlite::{params, Connection, types::ValueRef};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -38,18 +38,18 @@ struct Cli {
     // --- Parsing Options ---
     /// Regular Expression to parse lines.
     /// Capturing groups are extracted into columns.
-    #[arg(short = 'r', long = "regex", help_heading = "Parsing Options")]
+    #[arg(short = 'r', long = "regex", help_heading = "Parsing Options",verbatim_doc_comment)]
     regex: String,
 
-    /// Optional: Regular Expression to parse File Paths. 
-    /// If provided, files not matching this regex are ignored.
+    /// Optional: Regular Expression to parse File Paths.  
+    /// If provided, files not matching this regex are ignored.  
     /// Capturing groups are extracted into columns.
-    #[arg(long = "path-regex", help_heading = "Parsing Options")]
+    #[arg(long = "path-regex", help_heading = "Parsing Options", verbatim_doc_comment)]
     path_regex: Option<String>,
 
     /// File path filter (regex) for directory walking. 
     /// (Distinct from --path-regex, which extracts fields)
-    #[arg(short = 'f', long = "filter", help_heading = "Parsing Options")]
+    #[arg(short = 'f', long = "filter", help_heading = "Parsing Options", verbatim_doc_comment)]
     filter_pattern: Option<String>,
 
     /// Disable recursive directory walking
@@ -59,7 +59,7 @@ struct Cli {
     /// Field mapping (e.g., "p1:host;l1:date"). 
     /// Prefixes: 'p' for path capture groups, 'l' for line capture groups.
     /// If omitted, defaults to pf_N (path) and lf_N (line) or f_N.
-    #[arg(short = 'F', long = "fields", help_heading = "Parsing Options")]
+    #[arg(short = 'F', long = "fields", help_heading = "Parsing Options", verbatim_doc_comment)]
     field_map: Option<String>,
 
 
