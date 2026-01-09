@@ -33,6 +33,7 @@ impl Default for SplicerConfig {
 #[derive(Debug, Default)]
 pub struct SplicerStats {
     pub file_count: AtomicUsize,
+    pub skipped_count: AtomicUsize, // Track skipped files
     pub byte_count: AtomicUsize,
     pub chunk_count: AtomicUsize,
     pub paths_queued: AtomicIsize,
@@ -101,6 +102,8 @@ impl IoSplicer {
                     if matches_filter {
                         self.stats.paths_queued.fetch_add(1, Ordering::Relaxed);
                         if path_tx.send(path).is_err() { break; }
+                    } else {
+                        self.stats.skipped_count.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             });

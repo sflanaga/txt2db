@@ -1,15 +1,11 @@
-// Declare the module so we can use it
-mod io_splicer;
-
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::{bounded, Receiver};
-use io_splicer::{IoSplicer, SplicedChunk, SplicerConfig, SplicerStats};
 use regex::Regex;
 use rusqlite::{params, Connection, types::ValueRef};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -17,11 +13,13 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
+// Import the local module
+mod io_splicer;
+use crate::io_splicer::{IoSplicer, SplicedChunk, SplicerConfig, SplicerStats};
+
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 // term_width = 0 means "Auto-detect terminal width".
-// If the terminal is wide enough, it will do side-by-side alignment.
-// If the terminal is narrow (like 80 cols), it will wrap to next line automatically.
 #[command(term_width = 0)] 
 struct Cli {
     // --- Input Sources ---
@@ -238,14 +236,11 @@ fn execute_and_print_sql(conn: &Connection, sql_scripts: &[String], stage: &str)
         }
 
         for stmt_sql in statements {
-            // Remove trailing semicolon for prepare logic if present, though rusqlite usually handles it
             let clean_sql = stmt_sql.trim_end_matches(';');
             
-            // Check if it's a query or command
             let mut stmt = conn.prepare(clean_sql).context(format!("Failed to prepare SQL: {}", clean_sql))?;
             
             if stmt.column_count() > 0 {
-                // It's a query, print results
                 let col_count = stmt.column_count();
                 let col_names: Vec<String> = (0..col_count).map(|i| stmt.column_name(i).unwrap_or("?").to_string()).collect();
                 
@@ -270,9 +265,7 @@ fn execute_and_print_sql(conn: &Connection, sql_scripts: &[String], stage: &str)
                 }
                 println!("({} rows)\n", row_count);
             } else {
-                // Command
                 stmt.execute([])?;
-                // println!("> Executed: {}", clean_sql); 
             }
         }
     }
@@ -407,6 +400,7 @@ fn main() -> Result<()> {
         loop {
             thread::sleep(tick_duration);
             let files = mon_splicer.file_count.load(Ordering::Relaxed);
+            let skipped = mon_splicer.skipped_count.load(Ordering::Relaxed);
             let matches = mon_db.matched_lines.load(Ordering::Relaxed);
             let commits = mon_db.committed_records.load(Ordering::Relaxed);
             let bytes = mon_db.bytes_processed.load(Ordering::Relaxed);
@@ -426,8 +420,8 @@ fn main() -> Result<()> {
             let display_files_rate = files_d as f64 * rate_factor;
             let display_recs_rate = recs_d as f64 * rate_factor;
 
-            println!("Stats: [Files: {} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Matches: {}] [DB Insert: {} ({:.0}/s)]", 
-                files, display_files_rate, mb_total, display_mb_rate, matches, commits, display_recs_rate);
+            println!("Stats: [Files: {}/{} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Matches: {}] [DB Insert: {} ({:.0}/s)]", 
+                files, skipped, display_files_rate, mb_total, display_mb_rate, matches, commits, display_recs_rate);
         }
     });
 
@@ -446,8 +440,19 @@ fn main() -> Result<()> {
     let track_matches = cli.track_matches;
     let col_defs_for_db = columns.iter().map(|c| c.name.clone()).collect();
     let db_worker_stats = db_stats.clone();
+    let db_splicer_stats = splicer_stats.clone();
+    
     let db_handle = thread::spawn(move || {
-        run_db_worker(db_filename, db_rx, batch_size, track_matches, col_defs_for_db, db_worker_stats, run_meta)
+        run_db_worker(
+            db_filename, 
+            db_rx, 
+            batch_size, 
+            track_matches, 
+            col_defs_for_db, 
+            db_worker_stats,
+            db_splicer_stats,
+            run_meta
+        )
     });
 
     // Parsers
@@ -611,6 +616,7 @@ fn main() -> Result<()> {
     // Final Stats
     let duration = start_time.elapsed().as_secs_f64();
     let files = splicer_stats.file_count.load(Ordering::Relaxed);
+    let skipped = splicer_stats.skipped_count.load(Ordering::Relaxed);
     let bytes = db_stats.bytes_processed.load(Ordering::Relaxed);
     let matches = db_stats.matched_lines.load(Ordering::Relaxed);
     let commits = db_stats.committed_records.load(Ordering::Relaxed);
@@ -619,8 +625,8 @@ fn main() -> Result<()> {
     let files_rate = if duration > 0.0 { files as f64 / duration } else { 0.0 };
     let recs_rate = if duration > 0.0 { commits as f64 / duration } else { 0.0 };
 
-    println!("Done:  [Files: {} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Matches: {}] [DB Insert: {} ({:.0}/s)]", 
-                files, files_rate, mb_total, mb_rate, matches, commits, recs_rate);
+    println!("Done:  [Files: {}/{} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Matches: {}] [DB Insert: {} ({:.0}/s)]", 
+                files, skipped, files_rate, mb_total, mb_rate, matches, commits, recs_rate);
     println!("Run ID: {}", run_id);
     println!("Data Table: data_{}", run_id);
 
@@ -634,6 +640,7 @@ fn run_db_worker(
     track_matches: bool,
     columns: Vec<String>,
     stats: Arc<DbStats>,
+    splicer_stats: Arc<SplicerStats>,
     meta: RunMetadata,
 ) -> Result<i64> {
     let mut conn = Connection::open(path)?;
@@ -661,7 +668,12 @@ fn run_db_worker(
             id INTEGER PRIMARY KEY,
             timestamp TEXT,
             command TEXT,
-            regex TEXT
+            regex TEXT,
+            files_processed INTEGER DEFAULT 0,
+            files_skipped INTEGER DEFAULT 0,
+            bytes_processed INTEGER DEFAULT 0,
+            match_count INTEGER DEFAULT 0,
+            finished_at TEXT
         )", 
         [],
     )?;
@@ -700,6 +712,30 @@ fn run_db_worker(
     }
     if !batch.is_empty() {
         flush_batch(&mut conn, &mut batch, &mut file_cache, track_matches, &columns, &stats, &data_table_name, &matches_table_name, run_id)?;
+    }
+
+    // Update Runs with Final Stats
+    let final_files = splicer_stats.file_count.load(Ordering::Relaxed);
+    let final_skipped = splicer_stats.skipped_count.load(Ordering::Relaxed);
+    let final_bytes = stats.bytes_processed.load(Ordering::Relaxed);
+    let final_matches = stats.matched_lines.load(Ordering::Relaxed);
+    let finished_at = get_iso_time();
+
+    conn.execute("UPDATE runs SET files_processed = ?, files_skipped = ?, bytes_processed = ?, match_count = ?, finished_at = ? WHERE id = ?",
+        params![final_files, final_skipped, final_bytes, final_matches, finished_at, run_id])?;
+
+
+    // --- CREATE LATEST VIEWS ---
+    let _ = conn.execute("DROP VIEW IF EXISTS data", []);
+    let create_view = format!("CREATE VIEW data AS SELECT * FROM {}", data_table_name);
+    if let Err(e) = conn.execute(&create_view, []) {
+        eprintln!("Warning: Could not create 'data' view: {}", e);
+    }
+    
+    if track_matches {
+        let _ = conn.execute("DROP VIEW IF EXISTS matches", []);
+        let create_view = format!("CREATE VIEW matches AS SELECT * FROM {}", matches_table_name);
+         let _ = conn.execute(&create_view, []);
     }
 
     // --- POST-RUN SQL ---
