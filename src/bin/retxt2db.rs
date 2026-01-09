@@ -105,6 +105,23 @@ struct RunMetadata {
     created_at: String,
 }
 
+fn get_iso_time() -> String {
+    // Try to use system date command for ISO format to avoid chrono dependency
+    let output = std::process::Command::new("date")
+        .args(["-u", "+%Y-%m-%d %H:%M:%S.%3N"])
+        .output()
+        .ok();
+    
+    if let Some(o) = output {
+        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    // Fallback if date command fails
+    format!("{:?}", SystemTime::now())
+}
+
 fn main() -> Result<()> {
     // Capture raw args for history logging
     let raw_args: Vec<String> = std::env::args().collect();
@@ -241,7 +258,7 @@ fn main() -> Result<()> {
     let run_meta = RunMetadata {
         regex: cli.regex.clone(),
         command_args: command_line,
-        created_at: format!("{:?}", SystemTime::now()), // Simple debug format to avoid chrono dep issues
+        created_at: get_iso_time(),
     };
 
     // Start DB Worker
@@ -446,11 +463,20 @@ fn run_db_worker(
     )?;
     let run_id = conn.last_insert_rowid();
 
-    // 3. Setup Global Files Table
+    // 3. Setup Global Files Table (Now with run_id)
+    // We add run_id to schema. Note: If database exists from previous version (only id, path),
+    // we need to handle it. For now, assuming fresh DB or compatible schema.
+    // Ideally we would ALTER TABLE.
+    let _ = conn.execute("ALTER TABLE files ADD COLUMN run_id INTEGER", []);
+
     conn.execute("CREATE TABLE IF NOT EXISTS files (
         id INTEGER PRIMARY KEY, 
-        path TEXT UNIQUE
+        run_id INTEGER,
+        path TEXT
     )", [])?;
+
+    // Create Index for (run_id, path) to allow efficient duplicate checking per run
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_run_path ON files(run_id, path)", [])?;
 
     // 4. Setup Run-Specific Data Tables
     let data_table_name = format!("data_{}", run_id);
@@ -473,8 +499,9 @@ fn run_db_worker(
     
     let match_id_col = if track_matches { ", match_id INTEGER" } else { "" };
     
+    // Data Table: now includes run_id and file_id
     let create_sql = format!(
-        "CREATE TABLE {} (id INTEGER PRIMARY KEY{}{})", 
+        "CREATE TABLE {} (id INTEGER PRIMARY KEY, run_id INTEGER, file_id INTEGER{}{})", 
         data_table_name, match_id_col, col_defs
     );
     conn.execute(&create_sql, [])?;
@@ -485,12 +512,12 @@ fn run_db_worker(
     while let Ok(msg) = rx.recv() {
         batch.push(msg);
         if batch.len() >= batch_size {
-            flush_batch(&mut conn, &mut batch, &mut file_cache, track_matches, &columns, &stats, &data_table_name, &matches_table_name)?;
+            flush_batch(&mut conn, &mut batch, &mut file_cache, track_matches, &columns, &stats, &data_table_name, &matches_table_name, run_id)?;
         }
     }
     
     if !batch.is_empty() {
-        flush_batch(&mut conn, &mut batch, &mut file_cache, track_matches, &columns, &stats, &data_table_name, &matches_table_name)?;
+        flush_batch(&mut conn, &mut batch, &mut file_cache, track_matches, &columns, &stats, &data_table_name, &matches_table_name, run_id)?;
     }
 
     Ok(run_id)
@@ -505,6 +532,7 @@ fn flush_batch(
     stats: &Arc<DbStats>,
     data_table: &str,
     matches_table: &str,
+    run_id: i64,
 ) -> Result<()> {
     let tx = conn.transaction()?;
     
@@ -513,23 +541,30 @@ fn flush_batch(
             
         let mut current_match_id = None;
 
-        if track_matches {
-            let file_id = if let Some(p) = &file_path {
-                if let Some(&id) = file_cache.get(&**p) {
-                    id
-                } else {
-                    let path_str = p.to_string_lossy();
-                    tx.execute("INSERT OR IGNORE INTO files (path) VALUES (?)", [&path_str])?;
-                    
-                    let mut stmt = tx.prepare("SELECT id FROM files WHERE path = ?")?;
-                    let id: i64 = stmt.query_row([&path_str], |row| row.get(0))?;
-                    file_cache.insert((**p).clone(), id);
-                    id
-                }
+        // Resolve file_id always (needed for data table now)
+        let file_id = if let Some(p) = &file_path {
+            if let Some(&id) = file_cache.get(&**p) {
+                id
             } else {
-                0
-            };
+                let path_str = p.to_string_lossy();
+                // Insert with run_id. No conflict with other runs.
+                tx.execute(
+                    "INSERT OR IGNORE INTO files (run_id, path) VALUES (?, ?)", 
+                    params![run_id, path_str]
+                )?;
+                
+                // Retrieve ID (scoped to this run_id for safety, though path is enough if unique per run)
+                let mut stmt = tx.prepare("SELECT id FROM files WHERE run_id = ? AND path = ?")?;
+                let id: i64 = stmt.query_row(params![run_id, path_str], |row| row.get(0))?;
+                
+                file_cache.insert((**p).clone(), id);
+                id
+            }
+        } else {
+            0 // 0 means Stdin/Unknown
+        };
 
+        if track_matches {
             let sql = format!("INSERT INTO {} (file_id, offset, content) VALUES (?, ?, ?)", matches_table);
             tx.execute(
                 &sql,
@@ -541,6 +576,11 @@ fn flush_batch(
         let mut place_holders = String::new();
         let mut values: Vec<String> = Vec::new();
         
+        // Add run_id and file_id first
+        place_holders.push_str("?, ?, ");
+        values.push(run_id.to_string());
+        values.push(file_id.to_string());
+
         if track_matches {
             place_holders.push_str("?, ");
             values.push(current_match_id.unwrap().to_string());
@@ -555,7 +595,7 @@ fn flush_batch(
         let match_col = if track_matches { "match_id, " } else { "" };
         let col_names = columns.join(", ");
         
-        let sql = format!("INSERT INTO {} ({}{}) VALUES ({})", data_table, match_col, col_names, place_holders);
+        let sql = format!("INSERT INTO {} (run_id, file_id, {}{}) VALUES ({})", data_table, match_col, col_names, place_holders);
         
         let params_refs: Vec<&dyn rusqlite::ToSql> = values.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
         tx.execute(&sql, &*params_refs)?;
