@@ -3,9 +3,9 @@ use clap::Parser;
 use crossbeam_channel::{bounded, Receiver};
 use io_splicer_demo::{IoSplicer, SplicedChunk, SplicerConfig, SplicerStats};
 use regex::Regex;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, types::ValueRef};
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,35 +17,28 @@ use walkdir::WalkDir;
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Cli {
-    /// Files or directories to scan. If directories, they are walked recursively.
+    /// Files or directories to scan.
     #[arg(value_name = "INPUTS")]
     inputs: Vec<PathBuf>,
 
-    /// Read list of files from Stdin.
     #[arg(long = "files-from-stdin")]
     files_from_stdin: bool,
 
-    /// Read file list from a specific file.
     #[arg(long = "file-list")]
     file_list: Option<PathBuf>,
 
-    /// Read content DATA directly from Stdin (no filename).
     #[arg(long = "data-stdin")]
     data_stdin: bool,
 
-    /// Regular Expression to parse lines
     #[arg(short = 'r', long = "regex")]
     regex: String,
 
-    /// Optional: Regular Expression to parse File Paths. 
     #[arg(long = "path-regex")]
     path_regex: Option<String>,
 
-    /// File path filter (regex) for directory walking. 
     #[arg(short = 'f', long = "filter")]
     filter_pattern: Option<String>,
 
-    /// Disable recursive directory walking
     #[arg(long = "no-recursive")]
     no_recursive: bool,
 
@@ -63,6 +56,24 @@ struct Cli {
 
     #[arg(long = "ticker", default_value_t = 1000)]
     ticker_interval: u64,
+
+    /// SQLite Cache Size in MB
+    #[arg(long = "cache-mb", default_value_t = 100)]
+    cache_mb: i64,
+
+    // --- Pre/Post SQL Hooks ---
+    #[arg(long = "pre-sql")]
+    pre_sql: Option<String>,
+
+    #[arg(long = "post-sql")]
+    post_sql: Option<String>,
+
+    #[arg(long = "pre-sql-file")]
+    pre_sql_file: Option<PathBuf>,
+
+    #[arg(long = "post-sql-file")]
+    post_sql_file: Option<PathBuf>,
+    // --------------------------
 
     #[arg(short = 's', long = "splicers")]
     splicer_threads: Option<usize>,
@@ -103,10 +114,135 @@ struct RunMetadata {
     regex: String,
     command_args: String,
     created_at: String,
+    cache_mb: i64,
+    pre_sql: Vec<String>,
+    post_sql: Vec<String>,
 }
 
+/// Helper to split SQL safely respecting quotes and comments
+fn split_sql_statements(sql: &str) -> Vec<String> {
+    let mut stmts = Vec::new();
+    let mut current = String::new();
+    let mut chars = sql.chars().peekable();
+    
+    // States
+    let mut in_quote = false;
+    let mut quote_char = '\0';
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    while let Some(c) = chars.next() {
+        current.push(c);
+
+        if in_line_comment {
+            if c == '\n' { in_line_comment = false; }
+        } else if in_block_comment {
+            if c == '*' && chars.peek() == Some(&'/') {
+                current.push(chars.next().unwrap());
+                in_block_comment = false;
+            }
+        } else if in_quote {
+            if c == quote_char {
+                // Check escape (doubled quote)
+                if chars.peek() == Some(&quote_char) {
+                    current.push(chars.next().unwrap());
+                } else {
+                    in_quote = false;
+                }
+            }
+        } else {
+            // Normal State
+            match c {
+                '\'' | '"' => {
+                    in_quote = true;
+                    quote_char = c;
+                },
+                '-' => {
+                    if chars.peek() == Some(&'-') {
+                        current.push(chars.next().unwrap());
+                        in_line_comment = true;
+                    }
+                },
+                '/' => {
+                    if chars.peek() == Some(&'*') {
+                        current.push(chars.next().unwrap());
+                        in_block_comment = true;
+                    }
+                },
+                ';' => {
+                    // Split point!
+                    let stmt = current.trim().to_string();
+                    if !stmt.is_empty() {
+                        stmts.push(stmt);
+                    }
+                    current = String::new();
+                },
+                _ => {}
+            }
+        }
+    }
+    
+    let stmt = current.trim().to_string();
+    if !stmt.is_empty() {
+        stmts.push(stmt);
+    }
+    stmts
+}
+
+fn execute_and_print_sql(conn: &Connection, sql_scripts: &[String], stage: &str) -> Result<()> {
+    for (i, script) in sql_scripts.iter().enumerate() {
+        if script.trim().is_empty() { continue; }
+        
+        let statements = split_sql_statements(script);
+        
+        if !statements.is_empty() {
+            println!("--- [Executing {} SQL Block #{} ({} statements)] ---", stage, i+1, statements.len());
+        }
+
+        for stmt_sql in statements {
+            // Remove trailing semicolon for prepare logic if present, though rusqlite usually handles it
+            let clean_sql = stmt_sql.trim_end_matches(';');
+            
+            // Check if it's a query or command
+            let mut stmt = conn.prepare(clean_sql).context(format!("Failed to prepare SQL: {}", clean_sql))?;
+            
+            if stmt.column_count() > 0 {
+                // It's a query, print results
+                let col_count = stmt.column_count();
+                let col_names: Vec<String> = (0..col_count).map(|i| stmt.column_name(i).unwrap_or("?").to_string()).collect();
+                
+                println!("> Query: {}", clean_sql);
+                println!("{}", col_names.join("\t"));
+                println!("{}", "-".repeat(col_names.len() * 10));
+
+                let mut rows = stmt.query([])?;
+                let mut row_count = 0;
+                while let Some(row) = rows.next()? {
+                    row_count += 1;
+                    let values: Vec<String> = (0..col_count).map(|i| {
+                        match row.get_ref(i).unwrap() {
+                            ValueRef::Null => "NULL".to_string(),
+                            ValueRef::Integer(i) => i.to_string(),
+                            ValueRef::Real(f) => f.to_string(),
+                            ValueRef::Text(t) => String::from_utf8_lossy(t).to_string(),
+                            ValueRef::Blob(_) => "<BLOB>".to_string(),
+                        }
+                    }).collect();
+                    println!("{}", values.join("\t"));
+                }
+                println!("({} rows)\n", row_count);
+            } else {
+                // Command
+                stmt.execute([])?;
+                // println!("> Executed: {}", clean_sql); 
+            }
+        }
+    }
+    Ok(())
+}
+
+
 fn get_iso_time() -> String {
-    // Try to use system date command for ISO format to avoid chrono dependency
     let output = std::process::Command::new("date")
         .args(["-u", "+%Y-%m-%d %H:%M:%S.%3N"])
         .output()
@@ -114,20 +250,25 @@ fn get_iso_time() -> String {
     
     if let Some(o) = output {
         let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-        if !s.is_empty() {
-            return s;
-        }
+        if !s.is_empty() { return s; }
     }
-    // Fallback if date command fails
     format!("{:?}", SystemTime::now())
 }
 
 fn main() -> Result<()> {
-    // Capture raw args for history logging
     let raw_args: Vec<String> = std::env::args().collect();
     let command_line = raw_args.join(" ");
-
     let cli = Cli::parse();
+
+    // Collect Pre/Post SQL
+    let mut pre_sql_scripts = Vec::new();
+    if let Some(s) = &cli.pre_sql { pre_sql_scripts.push(s.clone()); }
+    if let Some(p) = &cli.pre_sql_file { pre_sql_scripts.push(fs::read_to_string(p)?); }
+
+    let mut post_sql_scripts = Vec::new();
+    if let Some(s) = &cli.post_sql { post_sql_scripts.push(s.clone()); }
+    if let Some(p) = &cli.post_sql_file { post_sql_scripts.push(fs::read_to_string(p)?); }
+
 
     // Setup Regexes
     let line_re = Regex::new(&cli.regex).context("Invalid Line Regex")?;
@@ -137,7 +278,7 @@ fn main() -> Result<()> {
         None
     };
 
-    // Setup Field Mapping
+    // Setup Columns
     let mut columns = Vec::new();
     if let Some(map_str) = &cli.field_map {
         for part in map_str.split(';') {
@@ -145,7 +286,6 @@ fn main() -> Result<()> {
             if kv.len() == 2 {
                 let key = kv[0]; 
                 let name = kv[1].to_string();
-                
                 if let Some(idx_str) = key.strip_prefix('p') {
                     let idx: usize = idx_str.parse().context("Invalid path index")?;
                     columns.push(ColumnDef { name, source: FieldSource::Path(idx) });
@@ -180,7 +320,6 @@ fn main() -> Result<()> {
         }
     }
 
-    // Filename Logic
     let db_filename = cli.db_path.clone().unwrap_or_else(|| {
         let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let seconds_in_day = secs % 86400;
@@ -254,14 +393,17 @@ fn main() -> Result<()> {
         }
     });
 
-    // Run Metadata for DB
+    // Run Metadata
     let run_meta = RunMetadata {
         regex: cli.regex.clone(),
         command_args: command_line,
         created_at: get_iso_time(),
+        cache_mb: cli.cache_mb,
+        pre_sql: pre_sql_scripts,
+        post_sql: post_sql_scripts,
     };
 
-    // Start DB Worker
+    // DB Worker
     let batch_size = cli.batch_size;
     let track_matches = cli.track_matches;
     let col_defs_for_db = columns.iter().map(|c| c.name.clone()).collect();
@@ -270,7 +412,7 @@ fn main() -> Result<()> {
         run_db_worker(db_filename, db_rx, batch_size, track_matches, col_defs_for_db, db_worker_stats, run_meta)
     });
 
-    // Start Parsers
+    // Parsers
     let mut handles = vec![];
     for _ in 0..parser_count {
         let rx = splicer_rx.clone();
@@ -321,14 +463,12 @@ fn main() -> Result<()> {
                         let match_end = capture.get(0).map(|m| m.end()).unwrap_or(0);
                         let bytes = s.as_bytes();
 
-                        // Scan backward for newline
                         let start_idx = bytes[..match_start]
                             .iter()
                             .rposition(|&b| b == b'\n')
                             .map(|i| i + 1)
                             .unwrap_or(0);
 
-                        // Scan forward for newline
                         let end_idx = bytes[match_end..]
                             .iter()
                             .position(|&b| b == b'\n')
@@ -368,7 +508,7 @@ fn main() -> Result<()> {
     println!("Starting DB Ingestion Scan...");
     let splicer = IoSplicer::new(config, splicer_stats.clone(), splicer_tx, recycle_rx);
 
-    // --- Input Aggregation Logic ---
+    // Input Aggregation
     if cli.data_stdin {
         splicer.run_stream(io::stdin())?;
     } else {
@@ -460,12 +600,24 @@ fn run_db_worker(
 ) -> Result<i64> {
     let mut conn = Connection::open(path)?;
     
+    // Performance Tunings
     conn.execute_batch("
         PRAGMA synchronous = OFF;
         PRAGMA journal_mode = MEMORY;
+        PRAGMA temp_store = 2;
     ")?;
+    
+    // Set Cache Size
+    let cache_kib = meta.cache_mb * 1024;
+    let cache_pragma = format!("PRAGMA cache_size = -{};", cache_kib); // Negative means KiB
+    conn.execute(&cache_pragma, [])?;
 
-    // 1. Setup Runs Registry
+    // --- PRE-RUN SQL ---
+    if !meta.pre_sql.is_empty() {
+        execute_and_print_sql(&conn, &meta.pre_sql, "PRE")?;
+    }
+
+    // 1. Setup Shared Tables
     conn.execute(
         "CREATE TABLE IF NOT EXISTS runs (
             id INTEGER PRIMARY KEY,
@@ -475,52 +627,30 @@ fn run_db_worker(
         )", 
         [],
     )?;
-
-    // 2. Register this run
-    conn.execute(
-        "INSERT INTO runs (timestamp, command, regex) VALUES (?, ?, ?)",
-        params![meta.created_at, meta.command_args, meta.regex],
-    )?;
+    conn.execute("INSERT INTO runs (timestamp, command, regex) VALUES (?, ?, ?)",
+        params![meta.created_at, meta.command_args, meta.regex])?;
     let run_id = conn.last_insert_rowid();
 
-    // 3. Setup Global Files Table (Now with run_id)
     let _ = conn.execute("ALTER TABLE files ADD COLUMN run_id INTEGER", []);
-
-    conn.execute("CREATE TABLE IF NOT EXISTS files (
-        id INTEGER PRIMARY KEY, 
-        run_id INTEGER,
-        path TEXT
-    )", [])?;
-
+    conn.execute("CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY, run_id INTEGER, path TEXT)", [])?;
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_run_path ON files(run_id, path)", [])?;
 
-    // 4. Setup Run-Specific Data Tables
+    // 2. Setup Dynamic Tables
     let data_table_name = format!("data_{}", run_id);
     let matches_table_name = format!("matches_{}", run_id);
 
     if track_matches {
-        let sql = format!("CREATE TABLE {} (
-            id INTEGER PRIMARY KEY,
-            file_id INTEGER,
-            offset INTEGER,
-            content TEXT
-        )", matches_table_name);
-        conn.execute(&sql, [])?;
+        conn.execute(&format!("CREATE TABLE {} (id INTEGER PRIMARY KEY, file_id INTEGER, offset INTEGER, content TEXT)", matches_table_name), [])?;
     }
 
     let mut col_defs = String::new();
-    for col in &columns {
-        col_defs.push_str(&format!(", {} TEXT", col));
-    }
-    
+    for col in &columns { col_defs.push_str(&format!(", {} TEXT", col)); }
     let match_id_col = if track_matches { ", match_id INTEGER" } else { "" };
     
-    let create_sql = format!(
-        "CREATE TABLE {} (id INTEGER PRIMARY KEY, run_id INTEGER, file_id INTEGER{}{})", 
-        data_table_name, match_id_col, col_defs
-    );
-    conn.execute(&create_sql, [])?;
+    conn.execute(&format!("CREATE TABLE {} (id INTEGER PRIMARY KEY, run_id INTEGER, file_id INTEGER{}{})", 
+        data_table_name, match_id_col, col_defs), [])?;
 
+    // 3. Process Data
     let mut file_cache: HashMap<PathBuf, i64> = HashMap::new();
     let mut batch = Vec::with_capacity(batch_size);
     
@@ -530,9 +660,13 @@ fn run_db_worker(
             flush_batch(&mut conn, &mut batch, &mut file_cache, track_matches, &columns, &stats, &data_table_name, &matches_table_name, run_id)?;
         }
     }
-    
     if !batch.is_empty() {
         flush_batch(&mut conn, &mut batch, &mut file_cache, track_matches, &columns, &stats, &data_table_name, &matches_table_name, run_id)?;
+    }
+
+    // --- POST-RUN SQL ---
+    if !meta.post_sql.is_empty() {
+        execute_and_print_sql(&conn, &meta.post_sql, "POST")?;
     }
 
     Ok(run_id)
@@ -556,33 +690,22 @@ fn flush_batch(
             
         let mut current_match_id = None;
 
-        // Resolve file_id always (needed for data table now)
         let file_id = if let Some(p) = &file_path {
             if let Some(&id) = file_cache.get(&**p) {
                 id
             } else {
                 let path_str = p.to_string_lossy();
-                tx.execute(
-                    "INSERT OR IGNORE INTO files (run_id, path) VALUES (?, ?)", 
-                    params![run_id, path_str]
-                )?;
-                
+                tx.execute("INSERT OR IGNORE INTO files (run_id, path) VALUES (?, ?)", params![run_id, path_str])?;
                 let mut stmt = tx.prepare("SELECT id FROM files WHERE run_id = ? AND path = ?")?;
                 let id: i64 = stmt.query_row(params![run_id, path_str], |row| row.get(0))?;
-                
                 file_cache.insert((**p).clone(), id);
                 id
             }
-        } else {
-            0 
-        };
+        } else { 0 };
 
         if track_matches {
             let sql = format!("INSERT INTO {} (file_id, offset, content) VALUES (?, ?, ?)", matches_table);
-            tx.execute(
-                &sql,
-                params![file_id, offset as i64, line_content],
-            )?;
+            tx.execute(&sql, params![file_id, offset as i64, line_content])?;
             current_match_id = Some(tx.last_insert_rowid());
         }
 
@@ -606,9 +729,7 @@ fn flush_batch(
 
         let match_col = if track_matches { "match_id, " } else { "" };
         let col_names = columns.join(", ");
-        
         let sql = format!("INSERT INTO {} (run_id, file_id, {}{}) VALUES ({})", data_table, match_col, col_names, place_holders);
-        
         let params_refs: Vec<&dyn rusqlite::ToSql> = values.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
         tx.execute(&sql, &*params_refs)?;
         
