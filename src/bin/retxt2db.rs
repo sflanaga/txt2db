@@ -17,68 +17,99 @@ use walkdir::WalkDir;
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Cli {
-    /// Files or directories to scan.
-    #[arg(value_name = "INPUTS")]
+    // --- Input Sources ---
+    /// Files or directories to scan. If directories, they are walked recursively.
+    #[arg(value_name = "INPUTS", help_heading = "Input Sources")]
     inputs: Vec<PathBuf>,
 
-    #[arg(long = "files-from-stdin")]
+    /// Read list of files from Stdin.
+    #[arg(long = "files-from-stdin", help_heading = "Input Sources")]
     files_from_stdin: bool,
 
-    #[arg(long = "file-list")]
+    /// Read file list from a specific file.
+    #[arg(long = "file-list", help_heading = "Input Sources")]
     file_list: Option<PathBuf>,
 
-    #[arg(long = "data-stdin")]
+    /// Read content DATA directly from Stdin (no filename).
+    #[arg(long = "data-stdin", help_heading = "Input Sources")]
     data_stdin: bool,
 
-    #[arg(short = 'r', long = "regex")]
+
+    // --- Parsing Options ---
+    /// Regular Expression to parse lines.
+    /// Capturing groups are extracted into columns.
+    #[arg(short = 'r', long = "regex", help_heading = "Parsing Options")]
     regex: String,
 
-    #[arg(long = "path-regex")]
+    /// Optional: Regular Expression to parse File Paths. 
+    /// If provided, files not matching this regex are ignored.
+    /// Capturing groups are extracted into columns.
+    #[arg(long = "path-regex", help_heading = "Parsing Options")]
     path_regex: Option<String>,
 
-    #[arg(short = 'f', long = "filter")]
+    /// File path filter (regex) for directory walking. 
+    /// (Distinct from --path-regex, which extracts fields)
+    #[arg(short = 'f', long = "filter", help_heading = "Parsing Options")]
     filter_pattern: Option<String>,
 
-    #[arg(long = "no-recursive")]
+    /// Disable recursive directory walking
+    #[arg(long = "no-recursive", help_heading = "Parsing Options")]
     no_recursive: bool,
 
-    #[arg(long)]
-    db_path: Option<String>,
-
-    #[arg(short = 'F', long = "fields")]
+    /// Field mapping (e.g., "p1:host;l1:date"). 
+    /// Prefixes: 'p' for path capture groups, 'l' for line capture groups.
+    /// If omitted, defaults to pf_N (path) and lf_N (line) or f_N.
+    #[arg(short = 'F', long = "fields", help_heading = "Parsing Options")]
     field_map: Option<String>,
 
-    #[arg(long)]
+
+    // --- Database Options ---
+    /// Database output file. Defaults to scan_HHMMSS.db
+    #[arg(long, help_heading = "Database Options")]
+    db_path: Option<String>,
+
+    /// Enable optional tracking tables (files, matches) to store full context
+    #[arg(long, help_heading = "Database Options")]
     track_matches: bool,
 
-    #[arg(long, default_value = "1000")]
+    /// Batch size for DB inserts
+    #[arg(long, default_value = "1000", help_heading = "Database Options")]
     batch_size: usize,
 
-    #[arg(long = "ticker", default_value_t = 1000)]
-    ticker_interval: u64,
-
     /// SQLite Cache Size in MB
-    #[arg(long = "cache-mb", default_value_t = 100)]
+    #[arg(long = "cache-mb", default_value_t = 100, help_heading = "Database Options")]
     cache_mb: i64,
 
-    // --- Pre/Post SQL Hooks ---
-    #[arg(long = "pre-sql")]
+
+    // --- SQL Hooks ---
+    /// Execute SQL string BEFORE scanning starts
+    #[arg(long = "pre-sql", help_heading = "SQL Hooks")]
     pre_sql: Option<String>,
 
-    #[arg(long = "post-sql")]
+    /// Execute SQL string AFTER scanning finishes
+    #[arg(long = "post-sql", help_heading = "SQL Hooks")]
     post_sql: Option<String>,
 
-    #[arg(long = "pre-sql-file")]
+    /// Execute SQL script from file BEFORE scanning starts
+    #[arg(long = "pre-sql-file", help_heading = "SQL Hooks")]
     pre_sql_file: Option<PathBuf>,
 
-    #[arg(long = "post-sql-file")]
+    /// Execute SQL script from file AFTER scanning finishes
+    #[arg(long = "post-sql-file", help_heading = "SQL Hooks")]
     post_sql_file: Option<PathBuf>,
-    // --------------------------
 
-    #[arg(short = 's', long = "splicers")]
+
+    // --- Performance/System ---
+    /// Stats ticker interval in milliseconds
+    #[arg(long = "ticker", default_value_t = 1000, help_heading = "Performance")]
+    ticker_interval: u64,
+
+    /// Number of file splicer threads
+    #[arg(short = 's', long = "splicers", help_heading = "Performance")]
     splicer_threads: Option<usize>,
 
-    #[arg(short = 'p', long = "parsers")]
+    /// Number of regex parser threads
+    #[arg(short = 'p', long = "parsers", help_heading = "Performance")]
     parser_threads: Option<usize>,
 }
 

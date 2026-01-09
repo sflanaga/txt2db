@@ -4,7 +4,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use flate2::read::GzDecoder;
 use regex::Regex;
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -48,8 +48,6 @@ pub struct SplicedChunk {
     pub file_path: Option<Arc<PathBuf>>,
     pub offset: u64,
 }
-
-// Deprecated: Removed InputSource enum in favor of generic iterator
 
 pub struct IoSplicer {
     config: SplicerConfig,
