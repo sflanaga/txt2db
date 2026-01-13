@@ -302,7 +302,13 @@ fn main() -> Result<()> {
 
 
     // Setup Regexes
-    let line_re = Regex::new(&cli.regex).context("Invalid Line Regex")?;
+        // FIX: Use RegexBuilder to force multi-line mode.
+    // This ensures '^' matches the start of any line in the chunk,
+    // not just the start of the chunk itself.
+    let line_re = regex::RegexBuilder::new(&cli.regex)
+        .multi_line(true) // <--- CRITICAL FIX
+        .build()
+        .context("Invalid Line Regex")?;
     let path_re = if let Some(pr) = &cli.path_regex {
         Some(Regex::new(pr).context("Invalid Path Regex")?)
     } else {
