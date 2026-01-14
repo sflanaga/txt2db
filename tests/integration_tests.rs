@@ -349,9 +349,10 @@ fn test_map_mode_basic() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let input_path = temp.path().join("map.txt");
     let mut f = File::create(&input_path)?;
+    // Use B before A to test sorting logic
+    writeln!(f, "B 2")?;
     writeln!(f, "A 5")?;
     writeln!(f, "A 10")?;
-    writeln!(f, "B 2")?;
 
     let mut cmd = txt2db_cmd();
     let assert = cmd.arg(input_path.to_str().unwrap())
@@ -363,9 +364,24 @@ fn test_map_mode_basic() -> anyhow::Result<()> {
     let out = assert.get_output();
     let out_str = std::str::from_utf8(&out.stdout)?;
     
-    // A -> 15, B -> 2
-    assert!(out_str.contains("A\t15"));
-    assert!(out_str.contains("B\t2"));
+    // Split into non-empty lines
+    let lines: Vec<&str> = out_str.lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+
+    // Verify ordering
+    // 1. Header or "---" logic might be present, find data rows
+    // Expected Data:
+    // A	15
+    // B	2
+    
+    let data_lines: Vec<&str> = lines.into_iter()
+        .filter(|l| l.contains('\t') && !l.starts_with("Key_"))
+        .collect();
+
+    assert!(data_lines.len() >= 2);
+    assert_eq!(data_lines[0], "A\t15");
+    assert_eq!(data_lines[1], "B\t2");
     
     Ok(())
 }
@@ -375,17 +391,13 @@ fn test_map_mode_composite_and_parallel() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let input_path = temp.path().join("composite.txt");
     let mut f = File::create(&input_path)?;
-    // Groups: G1, G1. Subgroups: 0, 1.
-    // Key: (Group, Sub)
-    // G1 0 10
-    // G1 0 40 -> Sum 50
-    // G1 1 5
-    // G2 0 100
+    
+    // We intentionally write these out of order to verify sort
     for _ in 0..100 {
-        writeln!(f, "G1 0 10")?;
+        writeln!(f, "G2 0 100")?; // Should come last
+        writeln!(f, "G1 1 5")?;   // Should come middle
+        writeln!(f, "G1 0 10")?;  // Should come first
         writeln!(f, "G1 0 40")?;
-        writeln!(f, "G1 1 5")?;
-        writeln!(f, "G2 0 100")?;
     }
 
     let mut cmd = txt2db_cmd();
@@ -399,12 +411,20 @@ fn test_map_mode_composite_and_parallel() -> anyhow::Result<()> {
     let out = assert.get_output();
     let out_str = std::str::from_utf8(&out.stdout)?;
     
-    // G1 0 -> 50 * 100 = 5000
-    assert!(out_str.contains("G1\t0\t5000"));
-    // G1 1 -> 5 * 100 = 500
-    assert!(out_str.contains("G1\t1\t500"));
-     // G2 0 -> 100 * 100 = 10000
-    assert!(out_str.contains("G2\t0\t10000"));
+    let data_lines: Vec<&str> = out_str.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|l| l.contains('\t') && !l.starts_with("Key_"))
+        .collect();
+
+    assert!(data_lines.len() >= 3);
+    
+    // Check Sort Order and Sums
+    // 1. G1 0 -> 50 * 100 = 5000
+    assert_eq!(data_lines[0], "G1\t0\t5000");
+    // 2. G1 1 -> 5 * 100 = 500
+    assert_eq!(data_lines[1], "G1\t1\t500");
+    // 3. G2 0 -> 100 * 100 = 10000
+    assert_eq!(data_lines[2], "G2\t0\t10000");
 
     Ok(())
 }
@@ -429,3 +449,38 @@ fn test_map_mode_exclusive() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_map_mode_parse_error_counting() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let input_path = temp.path().join("errors.txt");
+    let mut f = File::create(&input_path)?;
+    // A 10 -> Good
+    // B 5.23 -> Should fail parsing as Integer
+    // C 20 -> Good
+    writeln!(f, "A 10")?;
+    writeln!(f, "B 5.23")?;
+    writeln!(f, "C 20")?;
+
+    let mut cmd = txt2db_cmd();
+    let assert = cmd.arg(input_path.to_str().unwrap())
+       .arg("--regex").arg(r"(\w+) ([\d\.]+)") // Capture the decimal
+       .arg("-m").arg("1_k_s;2_s_i") // Try to parse 2 as Integer (will fail for 5.23)
+       .assert()
+       .success();
+
+    let out = assert.get_output();
+    let out_str = std::str::from_utf8(&out.stdout)?;
+
+    // 1. Verify B is missing from output
+    assert!(!out_str.contains("B\t"), "Row B should be skipped due to parse error");
+    
+    // 2. Verify A and C are present
+    assert!(out_str.contains("A\t10"));
+    assert!(out_str.contains("C\t20"));
+
+    // 3. Verify Error Count in Stats line
+    // Expected: [Errors: 1]
+    assert!(out_str.contains("Errors: 1"), "Should report 1 parse error");
+
+    Ok(())
+}

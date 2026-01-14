@@ -4,6 +4,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use regex::Regex;
 use rusqlite::{params, Connection, types::ValueRef};
 use std::collections::{BTreeMap, HashMap};
+use std::collections::btree_map::Entry;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
 use std::path::PathBuf;
@@ -158,6 +159,7 @@ struct DbStats {
     committed_records: AtomicUsize,
     mapped_records: AtomicUsize, // New tracker for map mode
     bytes_processed: AtomicUsize,
+    parse_errors: AtomicUsize,   // <--- Added for error tracking
 }
 
 struct RunMetadata {
@@ -779,13 +781,12 @@ fn main() -> Result<()> {
         for h in map_handles {
             let sub_map = h.join().unwrap();
             for (key, val) in sub_map {
-                use std::collections::btree_map::Entry;
                 match final_map.entry(key) {
                     Entry::Vacant(e) => {
                         e.insert(val);
                     },
-                    Entry::Occupied(e) => {
-                        let existing = e.into_mut();
+                    Entry::Occupied(mut e) => {
+                        let existing = e.get_mut();
                         for (acc, other) in existing.iter_mut().zip(val.into_iter()) {
                             acc.merge(other);
                         }
@@ -804,13 +805,15 @@ fn main() -> Result<()> {
     let bytes = db_stats.bytes_processed.load(Ordering::Relaxed);
     let matches = db_stats.matched_lines.load(Ordering::Relaxed);
     let total_recs = db_stats.committed_records.load(Ordering::Relaxed) + db_stats.mapped_records.load(Ordering::Relaxed);
+    let parse_errors = db_stats.parse_errors.load(Ordering::Relaxed); // <--- Get error count
+    
     let mb_total = bytes as f64 / 1024.0 / 1024.0;
     let mb_rate = if duration > 0.0 { mb_total / duration } else { 0.0 };
     let files_rate = if duration > 0.0 { files as f64 / duration } else { 0.0 };
     let recs_rate = if duration > 0.0 { total_recs as f64 / duration } else { 0.0 };
 
-    println!("Done:  [Files: {}/{} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Matches: {}] [Processed: {} ({:.0}/s)]", 
-                files, skipped, files_rate, mb_total, mb_rate, matches, total_recs, recs_rate);
+    println!("Done:  [Files: {}/{} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Matches: {}] [Processed: {} ({:.0}/s)] [Errors: {}]", 
+                files, skipped, files_rate, mb_total, mb_rate, matches, total_recs, recs_rate, parse_errors);
 
     Ok(())
 }
@@ -846,10 +849,26 @@ fn run_mapper_worker(
             
             // Extract all fields
             let mut agg_row = Vec::with_capacity(specs.len());
+            let mut row_has_error = false; // Track error for this row
+
             for spec in &specs {
                 let raw = capture.get(spec.capture_index).map(|m| m.as_str()).unwrap_or("");
-                let val = AggValue::from_str(raw, spec.dtype).unwrap_or(AggValue::Null);
+                
+                // Try parsing. If None, it means format error.
+                let val = if let Some(v) = AggValue::from_str(raw, spec.dtype) {
+                    v
+                } else {
+                    // Parsing failed!
+                    row_has_error = true;
+                    AggValue::Null
+                };
                 agg_row.push(val);
+            }
+
+            // If any field failed parsing, skip this row and increment error count
+            if row_has_error {
+                stats.parse_errors.fetch_add(1, Ordering::Relaxed);
+                continue; 
             }
 
             // Build Key
@@ -1202,4 +1221,3 @@ fn flush_batch(
     tx.commit()?;
     Ok(())
 }
-
