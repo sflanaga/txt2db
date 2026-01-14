@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::{bounded, Receiver, Sender};
+use dashmap::DashMap;
 use regex::Regex;
 use rusqlite::{params, Connection, types::ValueRef};
 use std::collections::{BTreeMap, HashMap};
-use std::collections::btree_map::Entry;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
 use std::path::PathBuf;
@@ -80,6 +80,15 @@ struct Cli {
     /// Defaults to half of available CPUs if not set.
     #[arg(long = "map-threads", help_heading = "Performance")]
     map_threads: Option<usize>,
+    
+    // --- Error Handling ---
+    /// Print error location (File, Offset, Capture Group) to stderr as it happens.
+    #[arg(short = 'e', long = "show-errors", help_heading = "Error Handling")]
+    show_errors: bool,
+
+    /// Stop processing immediately upon the first parse error.
+    #[arg(short = 'E', long = "stop-on-error", help_heading = "Error Handling")]
+    stop_on_error: bool,
 
 
     // --- Database Options ---
@@ -157,9 +166,12 @@ enum DbRecord {
 struct DbStats {
     matched_lines: AtomicUsize,
     committed_records: AtomicUsize,
-    mapped_records: AtomicUsize, // New tracker for map mode
+    mapped_records: AtomicUsize, 
     bytes_processed: AtomicUsize,
-    parse_errors: AtomicUsize,   // <--- Added for error tracking
+    // Error tracking
+    total_errors: AtomicUsize,
+    // Map of Capture Index -> Count
+    error_counts: DashMap<usize, usize>, 
 }
 
 struct RunMetadata {
@@ -640,6 +652,9 @@ fn main() -> Result<()> {
         let map_thread_count = cli.map_threads.unwrap_or_else(|| std::cmp::max(1, total_cores / 2));
         println!("Starting Aggregation Scan with {} mapper threads...", map_thread_count);
 
+        let show_errors = cli.show_errors;
+        let stop_on_error = cli.stop_on_error;
+
         for _ in 0..map_thread_count {
             let rx = splicer_rx.clone();
             let r_tx = recycle_tx.clone();
@@ -648,7 +663,7 @@ fn main() -> Result<()> {
             let l_re = line_re.clone();
             
             map_handles.push(thread::spawn(move || {
-                run_mapper_worker(rx, r_tx, specs, l_re, stats)
+                run_mapper_worker(rx, r_tx, specs, l_re, stats, show_errors, stop_on_error)
             }));
         }
 
@@ -781,12 +796,13 @@ fn main() -> Result<()> {
         for h in map_handles {
             let sub_map = h.join().unwrap();
             for (key, val) in sub_map {
+                use std::collections::btree_map::Entry;
                 match final_map.entry(key) {
                     Entry::Vacant(e) => {
                         e.insert(val);
                     },
-                    Entry::Occupied(mut e) => {
-                        let existing = e.get_mut();
+                    Entry::Occupied(e) => {
+                        let existing = e.into_mut();
                         for (acc, other) in existing.iter_mut().zip(val.into_iter()) {
                             acc.merge(other);
                         }
@@ -805,15 +821,26 @@ fn main() -> Result<()> {
     let bytes = db_stats.bytes_processed.load(Ordering::Relaxed);
     let matches = db_stats.matched_lines.load(Ordering::Relaxed);
     let total_recs = db_stats.committed_records.load(Ordering::Relaxed) + db_stats.mapped_records.load(Ordering::Relaxed);
-    let parse_errors = db_stats.parse_errors.load(Ordering::Relaxed); // <--- Get error count
+    
+    let total_errs = db_stats.total_errors.load(Ordering::Relaxed);
     
     let mb_total = bytes as f64 / 1024.0 / 1024.0;
     let mb_rate = if duration > 0.0 { mb_total / duration } else { 0.0 };
     let files_rate = if duration > 0.0 { files as f64 / duration } else { 0.0 };
     let recs_rate = if duration > 0.0 { total_recs as f64 / duration } else { 0.0 };
 
-    println!("Done:  [Files: {}/{} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Matches: {}] [Processed: {} ({:.0}/s)] [Errors: {}]", 
-                files, skipped, files_rate, mb_total, mb_rate, matches, total_recs, recs_rate, parse_errors);
+    println!("Done:  [Files: {}/{} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Matches: {}] [Processed: {} ({:.0}/s)] [Parse Errors: {}]", 
+                files, skipped, files_rate, mb_total, mb_rate, matches, total_recs, recs_rate, total_errs);
+
+    if total_errs > 0 {
+        println!("\n--- Parse Errors by Field Index ---");
+        // DashMap does not support ordered iteration easily, copy to vec
+        let mut err_list: Vec<_> = db_stats.error_counts.iter().map(|r| (*r.key(), *r.value())).collect();
+        err_list.sort_by_key(|k| k.0);
+        for (idx, count) in err_list {
+            println!("Capture Group {}: {} errors", idx, count);
+        }
+    }
 
     Ok(())
 }
@@ -826,6 +853,8 @@ fn run_mapper_worker(
     specs: Vec<MapFieldSpec>,
     line_re: Regex,
     stats: Arc<DbStats>,
+    show_errors: bool,
+    stop_on_error: bool,
 ) -> BTreeMap<Vec<AggValue>, Vec<AggAccumulator>> {
     
     let mut map: BTreeMap<Vec<AggValue>, Vec<AggAccumulator>> = BTreeMap::new();
@@ -842,6 +871,9 @@ fn run_mapper_worker(
         let mut data = chunk.data;
         stats.bytes_processed.fetch_add(data.len(), Ordering::Relaxed);
         
+        let path_display = chunk.file_path.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "stdin".to_string());
+        let chunk_offset = chunk.offset;
+        
         let s = String::from_utf8_lossy(&data);
         
         for capture in line_re.captures_iter(&s) {
@@ -849,26 +881,40 @@ fn run_mapper_worker(
             
             // Extract all fields
             let mut agg_row = Vec::with_capacity(specs.len());
-            let mut row_has_error = false; // Track error for this row
+            let mut row_has_error = false;
+            
+            // Calculate line offset for error reporting
+            let match_start = capture.get(0).map(|m| m.start()).unwrap_or(0);
+            let abs_offset = chunk_offset + match_start as u64;
 
             for spec in &specs {
                 let raw = capture.get(spec.capture_index).map(|m| m.as_str()).unwrap_or("");
-                
-                // Try parsing. If None, it means format error.
-                let val = if let Some(v) = AggValue::from_str(raw, spec.dtype) {
-                    v
-                } else {
-                    // Parsing failed!
-                    row_has_error = true;
-                    AggValue::Null
-                };
-                agg_row.push(val);
+                match AggValue::from_str(raw, spec.dtype) {
+                    Some(val) => agg_row.push(val),
+                    None => {
+                        // Parse failure
+                        row_has_error = true;
+                        
+                        // Update stats
+                        stats.total_errors.fetch_add(1, Ordering::Relaxed);
+                        *stats.error_counts.entry(spec.capture_index).or_default() += 1;
+
+                        if show_errors || stop_on_error {
+                            eprintln!("Parse Error at {}:{} (Capture Group {}): Failed to parse '{}' as {:?}", 
+                                path_display, abs_offset, spec.capture_index, raw, spec.dtype);
+                        }
+
+                        if stop_on_error {
+                             eprintln!("Stopping due to error (-E flag).");
+                             std::process::exit(1); 
+                        }
+                    }
+                }
             }
 
-            // If any field failed parsing, skip this row and increment error count
+            // If ANY field failed, skip the row
             if row_has_error {
-                stats.parse_errors.fetch_add(1, Ordering::Relaxed);
-                continue; 
+                continue;
             }
 
             // Build Key

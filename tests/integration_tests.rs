@@ -452,35 +452,54 @@ fn test_map_mode_exclusive() -> anyhow::Result<()> {
 #[test]
 fn test_map_mode_parse_error_counting() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let input_path = temp.path().join("errors.txt");
+    let input_path = temp.path().join("mixed.txt");
     let mut f = File::create(&input_path)?;
-    // A 10 -> Good
-    // B 5.23 -> Should fail parsing as Integer
-    // C 20 -> Good
+    // Data:
+    // A 10  <- Valid
+    // B XX  <- Parse Error (Group 2 is not Int)
+    // C 5.5 <- Parse Error (Group 2 is not Int)
     writeln!(f, "A 10")?;
-    writeln!(f, "B 5.23")?;
-    writeln!(f, "C 20")?;
+    writeln!(f, "B XX")?;
+    writeln!(f, "C 5.5")?;
 
     let mut cmd = txt2db_cmd();
     let assert = cmd.arg(input_path.to_str().unwrap())
-       .arg("--regex").arg(r"(\w+) ([\d\.]+)") // Capture the decimal
-       .arg("-m").arg("1_k_s;2_s_i") // Try to parse 2 as Integer (will fail for 5.23)
+       .arg("--regex").arg(r"(\w+) (\S+)") // Capture everything non-whitespace
+       .arg("-m").arg("1_k_s;2_s_i") // Key=String, Sum=Int (Expects Int)
        .assert()
        .success();
-
+    
     let out = assert.get_output();
     let out_str = std::str::from_utf8(&out.stdout)?;
-
-    // 1. Verify B is missing from output
-    assert!(!out_str.contains("B\t"), "Row B should be skipped due to parse error");
     
-    // 2. Verify A and C are present
+    // Check Output (Only A should be present)
     assert!(out_str.contains("A\t10"));
-    assert!(out_str.contains("C\t20"));
+    assert!(!out_str.contains("B\t"));
+    assert!(!out_str.contains("C\t"));
 
-    // 3. Verify Error Count in Stats line
-    // Expected: [Errors: 1]
-    assert!(out_str.contains("Errors: 1"), "Should report 1 parse error");
+    // Check Stats for Parse Errors
+    assert!(out_str.contains("Parse Errors: 2"));
+    
+    // Check Specific Field Breakdown
+    assert!(out_str.contains("Capture Group 2: 2 errors"));
+
+    Ok(())
+}
+
+#[test]
+fn test_stop_on_error() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let input_path = temp.path().join("bad.txt");
+    let mut f = File::create(&input_path)?;
+    writeln!(f, "A XX")?; // Error
+
+    let mut cmd = txt2db_cmd();
+    cmd.arg(input_path.to_str().unwrap())
+       .arg("--regex").arg(r"(\w+) (\S+)")
+       .arg("-m").arg("1_k_s;2_s_i")
+       .arg("-E") // Stop on Error
+       .assert()
+       .failure(); // Should fail with exit code 1
 
     Ok(())
 }
