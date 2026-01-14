@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use crossbeam_channel::{bounded, Receiver};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use regex::Regex;
 use rusqlite::{params, Connection, types::ValueRef};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
 use std::path::PathBuf;
@@ -66,6 +66,19 @@ struct Cli {
     /// If omitted, defaults to pf_N (path) and lf_N (line) or f_N.
     #[arg(short = 'F', long = "fields", help_heading = "Parsing Options", verbatim_doc_comment)]
     field_map: Option<String>,
+    
+    /// Aggregation map definition (e.g. "1_k_i;2_k_s;5_s_i").
+    /// Mutually exclusive with Database mode.
+    /// Format: index_role_type separated by ;. 
+    /// Roles: k=Key, s=Sum, c=Count, x=Max, n=Min.
+    /// Types: i=i64, u=u64, f=f64, s=String.
+    #[arg(short = 'm', long = "map", help_heading = "Parsing Options")]
+    map_def: Option<String>,
+
+    /// Number of mapper threads to use for aggregation.
+    /// Defaults to half of available CPUs if not set.
+    #[arg(long = "map-threads", help_heading = "Performance")]
+    map_threads: Option<usize>,
 
 
     // --- Database Options ---
@@ -113,7 +126,7 @@ struct Cli {
     #[arg(short = 's', long = "splicers", help_heading = "Performance")]
     splicer_threads: Option<usize>,
 
-    /// Number of regex parser threads
+    /// Number of regex parser threads (Only used in DB mode)
     #[arg(short = 'p', long = "parsers", help_heading = "Performance")]
     parser_threads: Option<usize>,
 }
@@ -143,6 +156,7 @@ enum DbRecord {
 struct DbStats {
     matched_lines: AtomicUsize,
     committed_records: AtomicUsize,
+    mapped_records: AtomicUsize, // New tracker for map mode
     bytes_processed: AtomicUsize,
 }
 
@@ -154,6 +168,153 @@ struct RunMetadata {
     pre_sql: Vec<String>,
     post_sql: Vec<String>,
 }
+
+// --- Map Mode Definitions ---
+
+#[derive(Clone, Debug, PartialEq, Copy)]
+enum AggRole { Key, Sum, Count, Max, Min }
+
+#[derive(Clone, Debug, PartialEq, Copy)]
+enum AggType { I64, U64, F64, Str }
+
+#[derive(Clone, Debug)]
+struct MapFieldSpec {
+    capture_index: usize,
+    role: AggRole,
+    dtype: AggType,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+struct OrderedFloat(f64);
+impl Eq for OrderedFloat {}
+impl Ord for OrderedFloat {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.partial_cmp(&other.0).unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+impl std::fmt::Display for OrderedFloat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Debug, PartialOrd, PartialEq, Ord, Eq)]
+enum AggValue {
+    Null,
+    I64(i64),
+    U64(u64),
+    F64(OrderedFloat),
+    Str(String),
+}
+
+impl AggValue {
+    fn from_str(s: &str, t: AggType) -> Option<Self> {
+        if s.is_empty() { return Some(AggValue::Null); }
+        match t {
+            AggType::Str => Some(AggValue::Str(s.to_string())),
+            AggType::I64 => s.parse().ok().map(AggValue::I64),
+            AggType::U64 => s.parse().ok().map(AggValue::U64),
+            AggType::F64 => s.parse().ok().map(|f| AggValue::F64(OrderedFloat(f))),
+        }
+    }
+    
+    fn is_null(&self) -> bool {
+        matches!(self, AggValue::Null)
+    }
+}
+
+#[derive(Clone, Debug)]
+enum AggAccumulator {
+    SumI(i64),
+    SumU(u64),
+    SumF(f64),
+    Count(u64),
+    MaxI(i64),
+    MaxU(u64),
+    MaxF(f64),
+    MaxStr(String),
+    MinI(i64),
+    MinU(u64),
+    MinF(f64),
+    MinStr(String),
+    None,
+}
+
+impl AggAccumulator {
+    fn new(role: AggRole, dtype: AggType) -> Self {
+        match role {
+            AggRole::Sum => match dtype {
+                AggType::I64 => AggAccumulator::SumI(0),
+                AggType::U64 => AggAccumulator::SumU(0),
+                AggType::F64 => AggAccumulator::SumF(0.0),
+                _ => AggAccumulator::None,
+            },
+            AggRole::Count => AggAccumulator::Count(0),
+            AggRole::Max => match dtype {
+                AggType::I64 => AggAccumulator::MaxI(i64::MIN),
+                AggType::U64 => AggAccumulator::MaxU(u64::MIN),
+                AggType::F64 => AggAccumulator::MaxF(f64::MIN),
+                AggType::Str => AggAccumulator::MaxStr(String::new()),
+            },
+            AggRole::Min => match dtype {
+                AggType::I64 => AggAccumulator::MinI(i64::MAX),
+                AggType::U64 => AggAccumulator::MinU(u64::MAX),
+                AggType::F64 => AggAccumulator::MinF(f64::MAX),
+                AggType::Str => AggAccumulator::MinStr(String::new()), 
+            },
+            _ => AggAccumulator::None,
+        }
+    }
+
+    fn update(&mut self, val: &AggValue) {
+        if val.is_null() { return; }
+        match (self, val) {
+            (AggAccumulator::SumI(acc), AggValue::I64(v)) => *acc += v,
+            (AggAccumulator::SumU(acc), AggValue::U64(v)) => *acc += v,
+            (AggAccumulator::SumF(acc), AggValue::F64(v)) => *acc += v.0,
+            (AggAccumulator::Count(acc), _) => *acc += 1,
+            
+            (AggAccumulator::MaxI(acc), AggValue::I64(v)) => if *v > *acc { *acc = *v },
+            (AggAccumulator::MaxU(acc), AggValue::U64(v)) => if *v > *acc { *acc = *v },
+            (AggAccumulator::MaxF(acc), AggValue::F64(v)) => if v.0 > *acc { *acc = v.0 },
+            (AggAccumulator::MaxStr(acc), AggValue::Str(v)) => if v > acc { *acc = v.clone() },
+
+            (AggAccumulator::MinI(acc), AggValue::I64(v)) => if *v < *acc { *acc = *v },
+            (AggAccumulator::MinU(acc), AggValue::U64(v)) => if *v < *acc { *acc = *v },
+            (AggAccumulator::MinF(acc), AggValue::F64(v)) => if v.0 < *acc { *acc = v.0 },
+            (AggAccumulator::MinStr(acc), AggValue::Str(v)) => {
+                if acc.is_empty() || v < acc { *acc = v.clone() }
+            },
+            _ => {}
+        }
+    }
+
+    // Merge two accumulators from different threads
+    fn merge(&mut self, other: AggAccumulator) {
+        match (self, other) {
+            (AggAccumulator::SumI(a), AggAccumulator::SumI(b)) => *a += b,
+            (AggAccumulator::SumU(a), AggAccumulator::SumU(b)) => *a += b,
+            (AggAccumulator::SumF(a), AggAccumulator::SumF(b)) => *a += b,
+            (AggAccumulator::Count(a), AggAccumulator::Count(b)) => *a += b,
+            
+            (AggAccumulator::MaxI(a), AggAccumulator::MaxI(b)) => *a = (*a).max(b),
+            (AggAccumulator::MaxU(a), AggAccumulator::MaxU(b)) => *a = (*a).max(b),
+            (AggAccumulator::MaxF(a), AggAccumulator::MaxF(b)) => *a = if *a > b { *a } else { b },
+            (AggAccumulator::MaxStr(a), AggAccumulator::MaxStr(b)) => if b > *a { *a = b },
+
+            (AggAccumulator::MinI(a), AggAccumulator::MinI(b)) => *a = (*a).min(b),
+            (AggAccumulator::MinU(a), AggAccumulator::MinU(b)) => *a = (*a).min(b),
+            (AggAccumulator::MinF(a), AggAccumulator::MinF(b)) => *a = if *a < b { *a } else { b },
+            (AggAccumulator::MinStr(a), AggAccumulator::MinStr(b)) => {
+                if a.is_empty() || (!b.is_empty() && b < *a) { *a = b }
+            },
+            _ => {}
+        }
+    }
+}
+
+// --- End Map Definitions ---
+
 
 /// Helper to split SQL safely respecting quotes and comments
 fn split_sql_statements(sql: &str) -> Vec<String> {
@@ -286,6 +447,32 @@ fn get_iso_time() -> String {
     format!("{:?}", SystemTime::now())
 }
 
+fn parse_map_def(def: &str) -> Result<Vec<MapFieldSpec>> {
+    let mut specs = Vec::new();
+    for part in def.split(';') {
+        let tokens: Vec<&str> = part.split('_').collect();
+        if tokens.len() != 3 { anyhow::bail!("Invalid map spec: {}", part); }
+        let idx: usize = tokens[0].parse()?;
+        let role = match tokens[1] {
+            "k" => AggRole::Key,
+            "s" => AggRole::Sum,
+            "c" => AggRole::Count,
+            "x" => AggRole::Max,
+            "n" => AggRole::Min,
+            _ => anyhow::bail!("Unknown role: {}", tokens[1]),
+        };
+        let dtype = match tokens[2] {
+            "i" => AggType::I64,
+            "u" => AggType::U64,
+            "f" => AggType::F64,
+            "s" => AggType::Str,
+            _ => anyhow::bail!("Unknown type: {}", tokens[2]),
+        };
+        specs.push(MapFieldSpec { capture_index: idx, role, dtype });
+    }
+    Ok(specs)
+}
+
 fn main() -> Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
     let command_line = raw_args.join(" ");
@@ -302,15 +489,19 @@ fn main() -> Result<()> {
 
 
     // Setup Regexes
-        // FIX: Use RegexBuilder to force multi-line mode.
-    // This ensures '^' matches the start of any line in the chunk,
-    // not just the start of the chunk itself.
     let line_re = regex::RegexBuilder::new(&cli.regex)
-        .multi_line(true) // <--- CRITICAL FIX
+        .multi_line(true)
         .build()
         .context("Invalid Line Regex")?;
     let path_re = if let Some(pr) = &cli.path_regex {
         Some(Regex::new(pr).context("Invalid Path Regex")?)
+    } else {
+        None
+    };
+
+    // Setup Map Specs
+    let map_specs = if let Some(def) = &cli.map_def {
+        Some(parse_map_def(def)?)
     } else {
         None
     };
@@ -357,19 +548,8 @@ fn main() -> Result<()> {
         }
     }
 
-    let db_filename = cli.db_path.clone().unwrap_or_else(|| {
-        let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let seconds_in_day = secs % 86400;
-        let hour = seconds_in_day / 3600;
-        let minute = (seconds_in_day % 3600) / 60;
-        let second = seconds_in_day % 60;
-        format!("scan_{:02}{:02}{:02}.db", hour, minute, second)
-    });
-    println!("Database: {}", db_filename);
-
     let total_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let splicer_count = cli.splicer_threads.unwrap_or_else(|| std::cmp::max(1, total_cores / 2));
-    let parser_count = cli.parser_threads.unwrap_or_else(|| std::cmp::max(1, total_cores.saturating_sub(splicer_count)));
     
     let path_filter = if let Some(pattern) = cli.filter_pattern {
         Some(Regex::new(&pattern).context("Invalid filter regex")?)
@@ -389,8 +569,10 @@ fn main() -> Result<()> {
 
     let (splicer_tx, splicer_rx) = bounded::<SplicedChunk>(256);
     let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(512);
+    
+    // DB Channel (only used in DB mode)
     let (db_tx, db_rx) = bounded::<DbRecord>(4096);
-
+    
     let start_time = Instant::now();
 
     // Ticker
@@ -407,16 +589,20 @@ fn main() -> Result<()> {
             thread::sleep(tick_duration);
             let files = mon_splicer.file_count.load(Ordering::Relaxed);
             let skipped = mon_splicer.skipped_count.load(Ordering::Relaxed);
-            let matches = mon_db.matched_lines.load(Ordering::Relaxed);
+            
+            // Show DB or Map count
             let commits = mon_db.committed_records.load(Ordering::Relaxed);
+            let mapped = mon_db.mapped_records.load(Ordering::Relaxed);
+            let total_items = commits + mapped;
+            
             let bytes = mon_db.bytes_processed.load(Ordering::Relaxed);
             
             let files_d = files - last_files;
-            let recs_d = commits - last_recs;
+            let recs_d = total_items - last_recs;
             let bytes_d = bytes - last_bytes;
             
             last_files = files;
-            last_recs = commits;
+            last_recs = total_items;
             last_bytes = bytes;
 
             let mb_total = bytes as f64 / 1024.0 / 1024.0;
@@ -426,8 +612,8 @@ fn main() -> Result<()> {
             let display_files_rate = files_d as f64 * rate_factor;
             let display_recs_rate = recs_d as f64 * rate_factor;
 
-            println!("Stats: [Files: {}/{} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Matches: {}] [DB Insert: {} ({:.0}/s)]", 
-                files, skipped, display_files_rate, mb_total, display_mb_rate, matches, commits, display_recs_rate);
+            println!("Stats: [Files: {}/{} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Processed: {} ({:.0}/s)]", 
+                files, skipped, display_files_rate, mb_total, display_mb_rate, total_items, display_recs_rate);
         }
     });
 
@@ -441,120 +627,79 @@ fn main() -> Result<()> {
         post_sql: post_sql_scripts,
     };
 
-    // DB Worker
-    let batch_size = cli.batch_size;
-    let track_matches = cli.track_matches;
-    let col_defs_for_db = columns.iter().map(|c| c.name.clone()).collect();
-    let db_worker_stats = db_stats.clone();
-    let db_splicer_stats = splicer_stats.clone();
-    
-    let db_handle = thread::spawn(move || {
-        run_db_worker(
-            db_filename, 
-            db_rx, 
-            batch_size, 
-            track_matches, 
-            col_defs_for_db, 
-            db_worker_stats,
-            db_splicer_stats,
-            run_meta
-        )
-    });
+    // --- Mode Selection ---
+    let mut db_handle = None;
+    let mut parser_handles = vec![];
+    let mut map_handles = vec![];
 
-    // Parsers
-    let mut handles = vec![];
-    for _ in 0..parser_count {
-        let rx = splicer_rx.clone();
-        let r_tx = recycle_tx.clone();
-        let d_tx = db_tx.clone();
-        let thread_line_re = line_re.clone(); 
-        let thread_path_re = path_re.clone();
-        let thread_columns = columns.clone();
-        let t_stats = db_stats.clone();
+    if let Some(agg_specs) = map_specs.clone() {
+        // --- MAP MODE ---
+        // Spawn multiple MAP threads that consume chunks and return BTreeMaps
+        let map_thread_count = cli.map_threads.unwrap_or_else(|| std::cmp::max(1, total_cores / 2));
+        println!("Starting Aggregation Scan with {} mapper threads...", map_thread_count);
 
-        handles.push(thread::spawn(move || {
-            while let Ok(chunk) = rx.recv() {
-                let mut data = chunk.data;
-                t_stats.bytes_processed.fetch_add(data.len(), Ordering::Relaxed);
+        for _ in 0..map_thread_count {
+            let rx = splicer_rx.clone();
+            let r_tx = recycle_tx.clone();
+            let specs = agg_specs.clone();
+            let stats = db_stats.clone();
+            let l_re = line_re.clone();
+            
+            map_handles.push(thread::spawn(move || {
+                run_mapper_worker(rx, r_tx, specs, l_re, stats)
+            }));
+        }
 
-                let path_arc = chunk.file_path;
-                let chunk_offset = chunk.offset;
-                
-                let mut should_process = true;
-                let mut path_fields = Vec::with_capacity(thread_columns.len());
+    } else {
+        // --- DB MODE ---
+        let db_filename = cli.db_path.clone().unwrap_or_else(|| {
+            let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let seconds_in_day = secs % 86400;
+            let hour = seconds_in_day / 3600;
+            let minute = (seconds_in_day % 3600) / 60;
+            let second = seconds_in_day % 60;
+            format!("scan_{:02}{:02}{:02}.db", hour, minute, second)
+        });
+        println!("Database: {}", db_filename);
 
-                if let Some(pre) = &thread_path_re {
-                    if let Some(p) = &path_arc {
-                        let p_str = p.to_string_lossy();
-                        if let Some(caps) = pre.captures(&p_str) {
-                             for col in &thread_columns {
-                                 if let FieldSource::Path(idx) = col.source {
-                                     let val = caps.get(idx).map(|m| m.as_str().to_string()).unwrap_or_default();
-                                     path_fields.push((idx, val));
-                                 }
-                             }
-                        } else {
-                            should_process = false;
-                        }
-                    } else {
-                         should_process = false;
-                    }
-                }
-
-                if should_process {
-                    let s = String::from_utf8_lossy(&data);
-                    
-                    for capture in thread_line_re.captures_iter(&s) {
-                        t_stats.matched_lines.fetch_add(1, Ordering::Relaxed);
-                        
-                        // Extract Full Line Logic
-                        let match_start = capture.get(0).map(|m| m.start()).unwrap_or(0);
-                        let match_end = capture.get(0).map(|m| m.end()).unwrap_or(0);
-                        let bytes = s.as_bytes();
-
-                        let start_idx = bytes[..match_start]
-                            .iter()
-                            .rposition(|&b| b == b'\n')
-                            .map(|i| i + 1)
-                            .unwrap_or(0);
-
-                        let end_idx = bytes[match_end..]
-                            .iter()
-                            .position(|&b| b == b'\n')
-                            .map(|i| match_end + i)
-                            .unwrap_or(bytes.len());
-
-                        let full_line = s[start_idx..end_idx].trim_end().to_string();
-                        let match_offset = chunk_offset + start_idx as u64;
-
-                        let mut fields = Vec::with_capacity(thread_columns.len());
-                        for col in &thread_columns {
-                            match col.source {
-                                FieldSource::Line(idx) => {
-                                    fields.push(capture.get(idx).map(|m| m.as_str().to_string()));
-                                },
-                                FieldSource::Path(idx) => {
-                                    let val = path_fields.iter().find(|(k, _)| *k == idx).map(|(_, v)| v.clone());
-                                    fields.push(val);
-                                }
-                            }
-                        }
-                        let record = DbRecord::Data {
-                            file_path: path_arc.clone(),
-                            offset: match_offset,
-                            line_content: full_line,
-                            fields,
-                        };
-                        if d_tx.send(record).is_err() { break; }
-                    }
-                }
-                data.clear();
-                let _ = r_tx.send(data);
-            }
+        // Spawn DB Worker
+        let batch_size = cli.batch_size;
+        let track_matches = cli.track_matches;
+        let col_defs_for_db = columns.iter().map(|c| c.name.clone()).collect();
+        let db_worker_stats = db_stats.clone();
+        let db_splicer_stats = splicer_stats.clone();
+        
+        db_handle = Some(thread::spawn(move || {
+            run_db_worker(
+                db_filename, 
+                db_rx, 
+                batch_size, 
+                track_matches, 
+                col_defs_for_db, 
+                db_worker_stats,
+                db_splicer_stats,
+                run_meta
+            )
         }));
+
+        // Spawn DB Parsers
+        let parser_count = cli.parser_threads.unwrap_or_else(|| std::cmp::max(1, total_cores.saturating_sub(splicer_count)));
+        for _ in 0..parser_count {
+            let rx = splicer_rx.clone();
+            let r_tx = recycle_tx.clone();
+            let d_tx = db_tx.clone();
+            let thread_line_re = line_re.clone(); 
+            let thread_path_re = path_re.clone();
+            let thread_columns = columns.clone();
+            let t_stats = db_stats.clone();
+
+            parser_handles.push(thread::spawn(move || {
+                run_db_parser(rx, r_tx, d_tx, thread_line_re, thread_path_re, thread_columns, t_stats)
+            }));
+        }
+        println!("Starting DB Ingestion Scan...");
     }
 
-    println!("Starting DB Ingestion Scan...");
     let splicer = IoSplicer::new(config, splicer_stats.clone(), splicer_tx, recycle_rx);
 
     // Input Aggregation
@@ -615,9 +760,37 @@ fn main() -> Result<()> {
 
     drop(splicer);
 
-    for h in handles { h.join().unwrap(); }
+    // Finalize
+    for h in parser_handles { h.join().unwrap(); }
     drop(db_tx);
-    let run_id = db_handle.join().unwrap()?;
+    
+    // DB Finalization
+    if let Some(h) = db_handle {
+        let run_id = h.join().unwrap()?;
+        println!("Run ID: {}", run_id);
+        println!("Data Table: data_{}", run_id);
+    }
+    
+    // Map Merging
+    if !map_handles.is_empty() {
+        println!("Merging results from {} threads...", map_handles.len());
+        let mut final_map: BTreeMap<Vec<AggValue>, Vec<AggAccumulator>> = BTreeMap::new();
+        
+        for h in map_handles {
+            let sub_map = h.join().unwrap();
+            for (key, val) in sub_map {
+                let entry = final_map.entry(key).or_insert_with(|| val.clone());
+                // If it was already there, merge
+                if entry.len() == val.len() {
+                    for (acc, other) in entry.iter_mut().zip(val.into_iter()) {
+                        acc.merge(other);
+                    }
+                }
+            }
+        }
+        
+        print_map_results(final_map, map_specs.unwrap());
+    }
 
     // Final Stats
     let duration = start_time.elapsed().as_secs_f64();
@@ -625,18 +798,223 @@ fn main() -> Result<()> {
     let skipped = splicer_stats.skipped_count.load(Ordering::Relaxed);
     let bytes = db_stats.bytes_processed.load(Ordering::Relaxed);
     let matches = db_stats.matched_lines.load(Ordering::Relaxed);
-    let commits = db_stats.committed_records.load(Ordering::Relaxed);
+    let total_recs = db_stats.committed_records.load(Ordering::Relaxed) + db_stats.mapped_records.load(Ordering::Relaxed);
     let mb_total = bytes as f64 / 1024.0 / 1024.0;
     let mb_rate = if duration > 0.0 { mb_total / duration } else { 0.0 };
     let files_rate = if duration > 0.0 { files as f64 / duration } else { 0.0 };
-    let recs_rate = if duration > 0.0 { commits as f64 / duration } else { 0.0 };
+    let recs_rate = if duration > 0.0 { total_recs as f64 / duration } else { 0.0 };
 
-    println!("Done:  [Files: {}/{} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Matches: {}] [DB Insert: {} ({:.0}/s)]", 
-                files, skipped, files_rate, mb_total, mb_rate, matches, commits, recs_rate);
-    println!("Run ID: {}", run_id);
-    println!("Data Table: data_{}", run_id);
+    println!("Done:  [Files: {}/{} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Matches: {}] [Processed: {} ({:.0}/s)]", 
+                files, skipped, files_rate, mb_total, mb_rate, matches, total_recs, recs_rate);
 
     Ok(())
+}
+
+// --- WORKER FUNCTIONS ---
+
+fn run_mapper_worker(
+    rx: Receiver<SplicedChunk>,
+    recycle_tx: Sender<Vec<u8>>,
+    specs: Vec<MapFieldSpec>,
+    line_re: Regex,
+    stats: Arc<DbStats>,
+) -> BTreeMap<Vec<AggValue>, Vec<AggAccumulator>> {
+    
+    let mut map: BTreeMap<Vec<AggValue>, Vec<AggAccumulator>> = BTreeMap::new();
+    
+    // Pre-calculate indices
+    let mut key_indices = Vec::new();
+    let mut val_indices = Vec::new();
+    for (i, spec) in specs.iter().enumerate() {
+        if spec.role == AggRole::Key { key_indices.push(i); } 
+        else { val_indices.push(i); }
+    }
+
+    while let Ok(chunk) = rx.recv() {
+        let mut data = chunk.data;
+        stats.bytes_processed.fetch_add(data.len(), Ordering::Relaxed);
+        
+        let s = String::from_utf8_lossy(&data);
+        
+        for capture in line_re.captures_iter(&s) {
+            stats.matched_lines.fetch_add(1, Ordering::Relaxed);
+            
+            // Extract all fields
+            let mut agg_row = Vec::with_capacity(specs.len());
+            for spec in &specs {
+                let raw = capture.get(spec.capture_index).map(|m| m.as_str()).unwrap_or("");
+                let val = AggValue::from_str(raw, spec.dtype).unwrap_or(AggValue::Null);
+                agg_row.push(val);
+            }
+
+            // Build Key
+            let mut key = Vec::with_capacity(key_indices.len());
+            let mut key_valid = true;
+            for &idx in &key_indices {
+                let v = &agg_row[idx];
+                if v.is_null() { key_valid = false; break; }
+                key.push(v.clone());
+            }
+
+            if key_valid {
+                stats.mapped_records.fetch_add(1, Ordering::Relaxed);
+                
+                let entry = map.entry(key).or_insert_with(|| {
+                    val_indices.iter().map(|&i| {
+                        AggAccumulator::new(specs[i].role, specs[i].dtype)
+                    }).collect()
+                });
+
+                for (acc_idx, &row_idx) in val_indices.iter().enumerate() {
+                    entry[acc_idx].update(&agg_row[row_idx]);
+                }
+            }
+        }
+
+        data.clear();
+        let _ = recycle_tx.send(data);
+    }
+
+    map
+}
+
+fn run_db_parser(
+    rx: Receiver<SplicedChunk>,
+    recycle_tx: Sender<Vec<u8>>,
+    db_tx: Sender<DbRecord>,
+    line_re: Regex,
+    path_re: Option<Regex>,
+    columns: Vec<ColumnDef>,
+    stats: Arc<DbStats>,
+) {
+    while let Ok(chunk) = rx.recv() {
+        let mut data = chunk.data;
+        stats.bytes_processed.fetch_add(data.len(), Ordering::Relaxed);
+
+        let path_arc = chunk.file_path;
+        let chunk_offset = chunk.offset;
+        
+        let mut should_process = true;
+        let mut path_fields = Vec::with_capacity(columns.len());
+
+        if let Some(pre) = &path_re {
+            if let Some(p) = &path_arc {
+                let p_str = p.to_string_lossy();
+                if let Some(caps) = pre.captures(&p_str) {
+                        for col in &columns {
+                            if let FieldSource::Path(idx) = col.source {
+                                let val = caps.get(idx).map(|m| m.as_str().to_string()).unwrap_or_default();
+                                path_fields.push((idx, val));
+                            }
+                        }
+                } else {
+                    should_process = false;
+                }
+            } else {
+                    should_process = false;
+            }
+        }
+
+        if should_process {
+            let s = String::from_utf8_lossy(&data);
+            
+            for capture in line_re.captures_iter(&s) {
+                stats.matched_lines.fetch_add(1, Ordering::Relaxed);
+                
+                // Extract Full Line Logic
+                let match_start = capture.get(0).map(|m| m.start()).unwrap_or(0);
+                let match_end = capture.get(0).map(|m| m.end()).unwrap_or(0);
+                let bytes = s.as_bytes();
+
+                let start_idx = bytes[..match_start]
+                    .iter()
+                    .rposition(|&b| b == b'\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+
+                let end_idx = bytes[match_end..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map(|i| match_end + i)
+                    .unwrap_or(bytes.len());
+
+                let full_line = s[start_idx..end_idx].trim_end().to_string();
+                let match_offset = chunk_offset + start_idx as u64;
+
+                let mut fields = Vec::with_capacity(columns.len());
+                for col in &columns {
+                    match col.source {
+                        FieldSource::Line(idx) => {
+                            fields.push(capture.get(idx).map(|m| m.as_str().to_string()));
+                        },
+                        FieldSource::Path(idx) => {
+                            let val = path_fields.iter().find(|(k, _)| *k == idx).map(|(_, v)| v.clone());
+                            fields.push(val);
+                        }
+                    }
+                }
+                let record = DbRecord::Data {
+                    file_path: path_arc.clone(),
+                    offset: match_offset,
+                    line_content: full_line,
+                    fields,
+                };
+                if db_tx.send(record).is_err() { break; }
+            }
+        }
+        data.clear();
+        let _ = recycle_tx.send(data);
+    }
+}
+
+
+fn print_map_results(map: BTreeMap<Vec<AggValue>, Vec<AggAccumulator>>, specs: Vec<MapFieldSpec>) {
+    println!("\n--- Aggregation Map Results ---");
+    
+    let mut key_indices = Vec::new();
+    let mut val_indices = Vec::new();
+    for (i, spec) in specs.iter().enumerate() {
+        if spec.role == AggRole::Key { key_indices.push(i); } 
+        else { val_indices.push(i); }
+    }
+
+    // Header
+    let mut headers = Vec::new();
+    for &i in &key_indices { headers.push(format!("Key_{}", specs[i].capture_index)); }
+    for &i in &val_indices { headers.push(format!("{:?}_{}", specs[i].role, specs[i].capture_index)); }
+    println!("{}", headers.join("\t"));
+
+    for (key, values) in map {
+        let mut parts = Vec::new();
+        for k in key {
+            match k {
+                AggValue::I64(v) => parts.push(v.to_string()),
+                AggValue::U64(v) => parts.push(v.to_string()),
+                AggValue::F64(v) => parts.push(v.0.to_string()),
+                AggValue::Str(v) => parts.push(v),
+                AggValue::Null => parts.push("".to_string()),
+            }
+        }
+        for v in values {
+            match v {
+                AggAccumulator::SumI(x) => parts.push(x.to_string()),
+                AggAccumulator::SumU(x) => parts.push(x.to_string()),
+                AggAccumulator::SumF(x) => parts.push(x.to_string()),
+                AggAccumulator::Count(x) => parts.push(x.to_string()),
+                AggAccumulator::MaxI(x) => parts.push(x.to_string()),
+                AggAccumulator::MaxU(x) => parts.push(x.to_string()),
+                AggAccumulator::MaxF(x) => parts.push(x.to_string()),
+                AggAccumulator::MaxStr(x) => parts.push(x),
+                AggAccumulator::MinI(x) => parts.push(x.to_string()),
+                AggAccumulator::MinU(x) => parts.push(x.to_string()),
+                AggAccumulator::MinF(x) => parts.push(x.to_string()),
+                AggAccumulator::MinStr(x) => parts.push(x),
+                AggAccumulator::None => parts.push("".to_string()),
+            }
+        }
+        println!("{}", parts.join("\t"));
+    }
+    println!("-------------------------------");
 }
 
 fn run_db_worker(
