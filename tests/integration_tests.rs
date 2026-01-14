@@ -10,7 +10,9 @@ use flate2::Compression;
 
 // Helper to run the binary
 fn txt2db_cmd() -> Command {
-    Command::cargo_bin("txt2db").unwrap()
+    // FIX: Use env! macro which is the modern standard for integration tests
+    // avoiding the deprecated assert_cmd::Command::cargo_bin warning.
+    Command::new(env!("CARGO_BIN_EXE_txt2db"))
 }
 
 /// Helper to get a single cell value from the DB
@@ -341,3 +343,89 @@ fn test_no_recursive() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_map_mode_basic() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let input_path = temp.path().join("map.txt");
+    let mut f = File::create(&input_path)?;
+    writeln!(f, "A 5")?;
+    writeln!(f, "A 10")?;
+    writeln!(f, "B 2")?;
+
+    let mut cmd = txt2db_cmd();
+    let assert = cmd.arg(input_path.to_str().unwrap())
+       .arg("--regex").arg(r"(\w+) (\d+)")
+       .arg("-m").arg("1_k_s;2_s_i") // Key=String, Sum=Int
+       .assert()
+       .success();
+    
+    let out = assert.get_output();
+    let out_str = std::str::from_utf8(&out.stdout)?;
+    
+    // A -> 15, B -> 2
+    assert!(out_str.contains("A\t15"));
+    assert!(out_str.contains("B\t2"));
+    
+    Ok(())
+}
+
+#[test]
+fn test_map_mode_composite_and_parallel() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let input_path = temp.path().join("composite.txt");
+    let mut f = File::create(&input_path)?;
+    // Groups: G1, G1. Subgroups: 0, 1.
+    // Key: (Group, Sub)
+    // G1 0 10
+    // G1 0 40 -> Sum 50
+    // G1 1 5
+    // G2 0 100
+    for _ in 0..100 {
+        writeln!(f, "G1 0 10")?;
+        writeln!(f, "G1 0 40")?;
+        writeln!(f, "G1 1 5")?;
+        writeln!(f, "G2 0 100")?;
+    }
+
+    let mut cmd = txt2db_cmd();
+    let assert = cmd.arg(input_path.to_str().unwrap())
+       .arg("--regex").arg(r"(\w+) (\d+) (\d+)")
+       .arg("-m").arg("1_k_s;2_k_i;3_s_i") // Key1=Str, Key2=Int, Sum=Int
+       .arg("--map-threads").arg("4") // Force parallel
+       .assert()
+       .success();
+
+    let out = assert.get_output();
+    let out_str = std::str::from_utf8(&out.stdout)?;
+    
+    // G1 0 -> 50 * 100 = 5000
+    assert!(out_str.contains("G1\t0\t5000"));
+    // G1 1 -> 5 * 100 = 500
+    assert!(out_str.contains("G1\t1\t500"));
+     // G2 0 -> 100 * 100 = 10000
+    assert!(out_str.contains("G2\t0\t10000"));
+
+    Ok(())
+}
+
+#[test]
+fn test_map_mode_exclusive() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let input_path = temp.path().join("data.txt");
+    File::create(&input_path)?.write_all(b"DATA 1")?;
+    
+    let db_path = temp.path().join("should_not_exist.db");
+
+    let mut cmd = txt2db_cmd();
+    cmd.arg(input_path.to_str().unwrap())
+       .arg("--regex").arg(r"DATA (\d+)")
+       .arg("-m").arg("1_k_i")
+       .arg("--db-path").arg(db_path.to_str().unwrap()) // Should be ignored
+       .assert()
+       .success();
+
+    assert!(!db_path.exists(), "Database file should not be created in map mode");
+    Ok(())
+}
+

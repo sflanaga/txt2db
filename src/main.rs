@@ -779,11 +779,16 @@ fn main() -> Result<()> {
         for h in map_handles {
             let sub_map = h.join().unwrap();
             for (key, val) in sub_map {
-                let entry = final_map.entry(key).or_insert_with(|| val.clone());
-                // If it was already there, merge
-                if entry.len() == val.len() {
-                    for (acc, other) in entry.iter_mut().zip(val.into_iter()) {
-                        acc.merge(other);
+                use std::collections::btree_map::Entry;
+                match final_map.entry(key) {
+                    Entry::Vacant(e) => {
+                        e.insert(val);
+                    },
+                    Entry::Occupied(e) => {
+                        let existing = e.into_mut();
+                        for (acc, other) in existing.iter_mut().zip(val.into_iter()) {
+                            acc.merge(other);
+                        }
                     }
                 }
             }
@@ -1197,3 +1202,4 @@ fn flush_batch(
     tx.commit()?;
     Ok(())
 }
+
