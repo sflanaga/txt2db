@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use crossbeam_channel::{bounded, Receiver};
+use crossbeam_channel::bounded;
 use regex::Regex;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -25,13 +25,13 @@ use crate::config::{Cli, DisableConfig};
 use crate::io_splicer::{IoSplicer, SplicedChunk, SplicerConfig, SplicerStats};
 use crate::stats::{DbStats, RunMetadata, get_cpu_time_seconds, get_iso_time};
 use crate::aggregation::{
-    AggRole, AggAccumulator, AggValue, MapFieldSpec, 
+    AggAccumulator, AggValue, 
     parse_map_def, print_map_results
 };
 use crate::database::{
-    DbRecord, ColumnDef, FieldSource, run_db_worker, execute_and_print_sql
+    DbRecord, ColumnDef, FieldSource, run_db_worker
 };
-use crate::parser::{run_mapper_worker, run_db_parser};
+use crate::parser::{run_mapper_worker, run_db_parser, AnyRegex};
 
 fn main() -> Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
@@ -55,10 +55,20 @@ fn main() -> Result<()> {
 
 
     // Setup Regexes
-    let line_re = regex::RegexBuilder::new(&cli.regex)
-        .multi_line(true)
-        .build()
-        .context("Invalid Line Regex")?;
+    let line_re = if cli.use_pcre2 {
+        let re = pcre2::bytes::RegexBuilder::new()
+            .jit_if_available(true)
+            .build(&cli.regex)
+            .map_err(|e| anyhow::anyhow!("Invalid PCRE2 Regex: {}", e))?;
+        AnyRegex::Pcre(re)
+    } else {
+        let re = regex::RegexBuilder::new(&cli.regex)
+            .multi_line(true)
+            .build()
+            .context("Invalid Line Regex")?;
+        AnyRegex::Std(re)
+    };
+
     let path_re = if let Some(pr) = &cli.path_regex {
         Some(Regex::new(pr).context("Invalid Path Regex")?)
     } else {
@@ -97,6 +107,7 @@ fn main() -> Result<()> {
             for i in 1..pre.captures_len() {
                 columns.push(ColumnDef { name: format!("pf_{}", i), source: FieldSource::Path(i) });
             }
+            // Use line_re.captures_len() which is now abstract
             for i in 1..line_re.captures_len() {
                 columns.push(ColumnDef { name: format!("lf_{}", i), source: FieldSource::Line(i) });
             }

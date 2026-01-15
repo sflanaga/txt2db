@@ -30,6 +30,11 @@ pub struct Cli {
     #[arg(short = 'r', long = "regex", help_heading = "Parsing Options")]
     pub regex: String,
 
+    /// Use PCRE2 regex engine instead of the default Rust regex engine.
+    /// This may provide better compatibility for complex Perl-style patterns.
+    #[arg(long = "pcre2", help_heading = "Parsing Options")]
+    pub use_pcre2: bool,
+
     /// Optional: Regular Expression to parse File Paths.  
     /// If provided, files not matching this regex are ignored.  
     /// Capturing groups are extracted into columns.
