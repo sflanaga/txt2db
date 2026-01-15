@@ -3,6 +3,9 @@ name = "txt2db"
 version = "0.1.0"
 edition = "2021"
 
+[profile.release]
+#debug = true  # Keeps symbols, but still optimizes fully
+
 [dependencies]
 crossbeam-channel = "0.5"
 regex = "1"

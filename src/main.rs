@@ -1,22 +1,24 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::{bounded, Receiver, Sender};
-use dashmap::DashMap;
 use regex::Regex;
 use rusqlite::{params, Connection, types::ValueRef};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
-// Import the local module
+// Import local modules
 mod io_splicer;
+mod stats;
+
 use crate::io_splicer::{IoSplicer, SplicedChunk, SplicerConfig, SplicerStats};
+use crate::stats::{DbStats, RunMetadata};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -90,6 +92,12 @@ struct Cli {
     #[arg(short = 'E', long = "stop-on-error", help_heading = "Error Handling")]
     stop_on_error: bool,
 
+    // --- Performance Testing ---
+    /// Disable specific operations for profiling (comma separated):
+    /// regex (skip regex), maptarget (skip parsing), mapwrite (skip map insert)
+    #[arg(long = "disable-operations", help_heading = "Performance")]
+    disable_operations: Option<String>,
+
 
     // --- Database Options ---
     /// Database output file. Defaults to scan_HHMMSS.db
@@ -141,6 +149,30 @@ struct Cli {
     parser_threads: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct DisableConfig {
+    regex: bool,
+    map_target: bool,
+    map_write: bool,
+}
+
+impl DisableConfig {
+    fn from_str(s: Option<&str>) -> Self {
+        let mut cfg = DisableConfig::default();
+        if let Some(s) = s {
+            for part in s.split(',') {
+                match part.trim() {
+                    "regex" => cfg.regex = true,
+                    "maptarget" => cfg.map_target = true,
+                    "mapwrite" => cfg.map_write = true,
+                    _ => {}
+                }
+            }
+        }
+        cfg
+    }
+}
+
 #[derive(Clone, Debug)]
 enum FieldSource {
     Path(usize),
@@ -160,27 +192,6 @@ enum DbRecord {
         line_content: String,
         fields: Vec<Option<String>>,
     },
-}
-
-#[derive(Default)]
-struct DbStats {
-    matched_lines: AtomicUsize,
-    committed_records: AtomicUsize,
-    mapped_records: AtomicUsize, 
-    bytes_processed: AtomicUsize,
-    // Error tracking
-    total_errors: AtomicUsize,
-    // Map of Capture Index -> Count
-    error_counts: DashMap<usize, usize>, 
-}
-
-struct RunMetadata {
-    regex: String,
-    command_args: String,
-    created_at: String,
-    cache_mb: i64,
-    pre_sql: Vec<String>,
-    post_sql: Vec<String>,
 }
 
 // --- Map Mode Definitions ---
@@ -447,20 +458,6 @@ fn execute_and_print_sql(conn: &Connection, sql_scripts: &[String], stage: &str)
     Ok(())
 }
 
-
-fn get_iso_time() -> String {
-    let output = std::process::Command::new("date")
-        .args(["-u", "+%Y-%m-%d %H:%M:%S.%3N"])
-        .output()
-        .ok();
-    
-    if let Some(o) = output {
-        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-        if !s.is_empty() { return s; }
-    }
-    format!("{:?}", SystemTime::now())
-}
-
 fn parse_map_def(def: &str) -> Result<Vec<MapFieldSpec>> {
     let mut specs = Vec::new();
     for part in def.split(';') {
@@ -487,10 +484,29 @@ fn parse_map_def(def: &str) -> Result<Vec<MapFieldSpec>> {
     Ok(specs)
 }
 
+struct DisableFlags {
+    regex: bool,
+    maptarget: bool,
+    mapwrite: bool,
+}
+
 fn main() -> Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
     let command_line = raw_args.join(" ");
     let cli = Cli::parse();
+    
+    // Parsing disable options
+    let disable_ops = DisableConfig::from_str(cli.disable_operations.as_deref());
+    if cli.disable_operations.is_some() {
+        println!("Performance Mode: Disabling operations: {:?}", disable_ops);
+    }
+
+    let disable_ops_str = cli.disable_operations.clone().unwrap_or_default();
+    let disable_flags = DisableFlags {
+        regex: disable_ops_str.contains("regex"),
+        maptarget: disable_ops_str.contains("maptarget"),
+        mapwrite: disable_ops_str.contains("mapwrite"),
+    };
 
     // Collect Pre/Post SQL
     let mut pre_sql_scripts = Vec::new();
@@ -635,7 +651,7 @@ fn main() -> Result<()> {
     let run_meta = RunMetadata {
         regex: cli.regex.clone(),
         command_args: command_line,
-        created_at: get_iso_time(),
+        created_at: stats::get_iso_time(),
         cache_mb: cli.cache_mb,
         pre_sql: pre_sql_scripts,
         post_sql: post_sql_scripts,
@@ -654,6 +670,7 @@ fn main() -> Result<()> {
 
         let show_errors = cli.show_errors;
         let stop_on_error = cli.stop_on_error;
+        let flags = Arc::new(disable_flags);
 
         for _ in 0..map_thread_count {
             let rx = splicer_rx.clone();
@@ -661,9 +678,10 @@ fn main() -> Result<()> {
             let specs = agg_specs.clone();
             let stats = db_stats.clone();
             let l_re = line_re.clone();
+            let t_flags = flags.clone();
             
             map_handles.push(thread::spawn(move || {
-                run_mapper_worker(rx, r_tx, specs, l_re, stats, show_errors, stop_on_error)
+                run_mapper_worker(rx, r_tx, specs, l_re, stats, show_errors, stop_on_error, t_flags)
             }));
         }
 
@@ -816,23 +834,32 @@ fn main() -> Result<()> {
 
     // Final Stats
     let duration = start_time.elapsed().as_secs_f64();
+    let cpu_seconds = stats::get_cpu_time_seconds(); // Get CPU time
     let files = splicer_stats.file_count.load(Ordering::Relaxed);
     let skipped = splicer_stats.skipped_count.load(Ordering::Relaxed);
     let bytes = db_stats.bytes_processed.load(Ordering::Relaxed);
     let matches = db_stats.matched_lines.load(Ordering::Relaxed);
     let total_recs = db_stats.committed_records.load(Ordering::Relaxed) + db_stats.mapped_records.load(Ordering::Relaxed);
-    
-    let total_errs = db_stats.total_errors.load(Ordering::Relaxed);
+    let parse_errors = db_stats.total_errors.load(Ordering::Relaxed);
     
     let mb_total = bytes as f64 / 1024.0 / 1024.0;
     let mb_rate = if duration > 0.0 { mb_total / duration } else { 0.0 };
     let files_rate = if duration > 0.0 { files as f64 / duration } else { 0.0 };
     let recs_rate = if duration > 0.0 { total_recs as f64 / duration } else { 0.0 };
 
-    println!("Done:  [Files: {}/{} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Matches: {}] [Processed: {} ({:.0}/s)] [Parse Errors: {}]", 
-                files, skipped, files_rate, mb_total, mb_rate, matches, total_recs, recs_rate, total_errs);
+    // CPU Stats
+    let cpu_stats = if cpu_seconds > 0.0 {
+        format!(" [CPU: {:.2}s]", cpu_seconds)
+    } else {
+        String::new()
+    };
 
-    if total_errs > 0 {
+    println!("Done:  [Files: {}/{} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Matches: {}] [Processed: {} ({:.0}/s)] [Parse Errors: {}]{}", 
+                files, skipped, files_rate, mb_total, mb_rate, matches, total_recs, recs_rate, parse_errors, cpu_stats);
+
+    println!("Timing: [Wall Time: {:.3}s] [CPU Time: {:.3}s]", duration, cpu_seconds);
+
+    if parse_errors > 0 {
         println!("\n--- Parse Errors by Field Index ---");
         // DashMap does not support ordered iteration easily, copy to vec
         let mut err_list: Vec<_> = db_stats.error_counts.iter().map(|r| (*r.key(), *r.value())).collect();
@@ -855,6 +882,7 @@ fn run_mapper_worker(
     stats: Arc<DbStats>,
     show_errors: bool,
     stop_on_error: bool,
+    disable_flags: Arc<DisableFlags>,
 ) -> BTreeMap<Vec<AggValue>, Vec<AggAccumulator>> {
     
     let mut map: BTreeMap<Vec<AggValue>, Vec<AggAccumulator>> = BTreeMap::new();
@@ -871,15 +899,25 @@ fn run_mapper_worker(
         let mut data = chunk.data;
         stats.bytes_processed.fetch_add(data.len(), Ordering::Relaxed);
         
+        // Disable Operation Check 1: Regex
+        if disable_flags.regex {
+            // Just recycle and continue
+             data.clear();
+             let _ = recycle_tx.send(data);
+             continue;
+        }
+
         let path_display = chunk.file_path.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "stdin".to_string());
         let chunk_offset = chunk.offset;
         
         let s = String::from_utf8_lossy(&data);
         
+        // Normal Loop
         for capture in line_re.captures_iter(&s) {
             stats.matched_lines.fetch_add(1, Ordering::Relaxed);
             
-            // Extract all fields
+            if disable_flags.maptarget { continue; }
+
             let mut agg_row = Vec::with_capacity(specs.len());
             let mut row_has_error = false;
             
@@ -892,10 +930,7 @@ fn run_mapper_worker(
                 match AggValue::from_str(raw, spec.dtype) {
                     Some(val) => agg_row.push(val),
                     None => {
-                        // Parse failure
                         row_has_error = true;
-                        
-                        // Update stats
                         stats.total_errors.fetch_add(1, Ordering::Relaxed);
                         *stats.error_counts.entry(spec.capture_index).or_default() += 1;
 
@@ -903,21 +938,18 @@ fn run_mapper_worker(
                             eprintln!("Parse Error at {}:{} (Capture Group {}): Failed to parse '{}' as {:?}", 
                                 path_display, abs_offset, spec.capture_index, raw, spec.dtype);
                         }
-
                         if stop_on_error {
-                             eprintln!("Stopping due to error (-E flag).");
-                             std::process::exit(1); 
+                            eprintln!("Stopping due to error (-E flag).");
+                            std::process::exit(1); 
                         }
                     }
                 }
             }
 
-            // If ANY field failed, skip the row
-            if row_has_error {
-                continue;
-            }
+            if row_has_error { continue; }
 
-            // Build Key
+            if disable_flags.mapwrite { continue; }
+
             let mut key = Vec::with_capacity(key_indices.len());
             let mut key_valid = true;
             for &idx in &key_indices {
@@ -928,13 +960,11 @@ fn run_mapper_worker(
 
             if key_valid {
                 stats.mapped_records.fetch_add(1, Ordering::Relaxed);
-                
                 let entry = map.entry(key).or_insert_with(|| {
                     val_indices.iter().map(|&i| {
                         AggAccumulator::new(specs[i].role, specs[i].dtype)
                     }).collect()
                 });
-
                 for (acc_idx, &row_idx) in val_indices.iter().enumerate() {
                     entry[acc_idx].update(&agg_row[row_idx]);
                 }
@@ -1173,7 +1203,7 @@ fn run_db_worker(
     let final_skipped = splicer_stats.skipped_count.load(Ordering::Relaxed);
     let final_bytes = stats.bytes_processed.load(Ordering::Relaxed);
     let final_matches = stats.matched_lines.load(Ordering::Relaxed);
-    let finished_at = get_iso_time();
+    let finished_at = stats::get_iso_time();
 
     conn.execute("UPDATE runs SET files_processed = ?, files_skipped = ?, bytes_processed = ?, match_count = ?, finished_at = ? WHERE id = ?",
         params![final_files, final_skipped, final_bytes, final_matches, finished_at, run_id])?;
