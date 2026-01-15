@@ -61,12 +61,12 @@ pub struct Cli {
     /// Format: index_role_type separated by ;. 
     /// Roles: k=Key, s=Sum, c=Count, x=Max, n=Min.
     /// Types: i=i64, u=u64, f=f64, s=String.
-    #[arg(short = 'm', long = "map", help_heading = "Parsing Options")]
+    #[arg(short = 'm', long = "map", help_heading = "Parsing Options", verbatim_doc_comment)]
     pub map_def: Option<String>,
 
     /// Number of mapper threads to use for aggregation.
     /// Defaults to half of available CPUs if not set.
-    #[arg(long = "map-threads", help_heading = "Performance")]
+    #[arg(long = "map-threads", help_heading = "Performance", verbatim_doc_comment)]
     pub map_threads: Option<usize>,
     
     // --- Error Handling ---
@@ -83,8 +83,9 @@ pub struct Cli {
     pub profile: bool,
     
     /// Comma separated list of operations to disable for benchmarking:
-    /// 'regex' (disable regex parsing), 'maptarget' (disable value parsing), 'mapwrite' (disable map insertion).
-    #[arg(long = "disable-operations", help_heading = "Performance")]
+    /// 'regex' (disable regex parsing), 'maptarget' (disable value parsing), 
+    /// 'mapwrite' (disable map insertion).
+    #[arg(long = "disable-operations", help_heading = "Performance", verbatim_doc_comment)]
     pub disable_operations: Option<String>,
 
 
