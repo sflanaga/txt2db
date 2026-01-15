@@ -1,16 +1,26 @@
 use crossbeam_channel::{Receiver, Sender};
 use regex::Regex;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use crate::aggregation::{AggAccumulator, AggRole, AggValue, MapFieldSpec};
 use crate::config::DisableConfig;
 use crate::database::{ColumnDef, DbRecord, FieldSource};
 use crate::io_splicer::SplicedChunk;
 use crate::stats::DbStats;
+
+// Cheap way to measure relative cost on x86_64
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn read_cycle_counter() -> u64 {
+    unsafe { std::arch::x86_64::_rdtsc() }
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+fn read_cycle_counter() -> u64 {
+    // Fallback for non-x86 (e.g. ARM/M1) - roughly nanoseconds
+    std::time::Instant::now().elapsed().as_nanos() as u64
+}
 
 pub fn run_mapper_worker(
     rx: Receiver<SplicedChunk>,
@@ -26,10 +36,10 @@ pub fn run_mapper_worker(
     
     let mut map: BTreeMap<Vec<AggValue>, Vec<AggAccumulator>> = BTreeMap::new();
     
-    // Performance timers
-    let mut t_regex = Duration::ZERO;
-    let mut t_parse = Duration::ZERO;
-    let mut t_map = Duration::ZERO;
+    // Performance counters (Cycles)
+    let mut c_regex: u64 = 0;
+    let mut c_parse: u64 = 0;
+    let mut c_map: u64 = 0;
 
     // Pre-calculate indices
     let mut key_indices = Vec::new();
@@ -43,7 +53,6 @@ pub fn run_mapper_worker(
         let mut data = chunk.data;
         stats.bytes_processed.fetch_add(data.len(), Ordering::Relaxed);
         
-        // Disable Operation Check 1: Regex
         if disable_flags.regex {
              data.clear();
              let _ = recycle_tx.send(data);
@@ -55,16 +64,29 @@ pub fn run_mapper_worker(
         
         let s = String::from_utf8_lossy(&data);
         
-        // Decide loop type based on profiling
         if enable_profiling {
-            let t0 = Instant::now();
-            for capture in line_re.captures_iter(&s) {
-                let t1 = Instant::now();
-                t_regex += t1 - t0;
+            // We use an explicit manual iterator loop to measure regex time strictly
+            // Note: captures_iter is lazy, so "next()" does the heavy lifting.
+            let mut loc = 0;
+            let mut t0 = read_cycle_counter();
+            
+            // We loop manually to capture timing around the regex engine steps
+            while let Some(capture) = line_re.captures_at(&s, loc) {
+                let t1 = read_cycle_counter();
+                c_regex += t1.wrapping_sub(t0);
+
+                // Advance location for next search
+                if let Some(m) = capture.get(0) {
+                    loc = m.end();
+                    if m.start() == m.end() { loc += 1; } // Prevent infinite loop on empty match
+                } else {
+                    loc += 1;
+                }
 
                 stats.matched_lines.fetch_add(1, Ordering::Relaxed);
 
                 if disable_flags.map_target {
+                    t0 = read_cycle_counter(); // Reset start for next regex search
                     continue;
                 }
                 
@@ -95,12 +117,16 @@ pub fn run_mapper_worker(
                     }
                 }
                 
-                let t2 = Instant::now();
-                t_parse += t2 - t1;
+                let t2 = read_cycle_counter();
+                c_parse += t2.wrapping_sub(t1);
 
-                if row_has_error { continue; }
+                if row_has_error { 
+                    t0 = read_cycle_counter(); // Reset start
+                    continue; 
+                }
 
                 if disable_flags.map_write {
+                    t0 = read_cycle_counter(); // Reset start
                     continue;
                 }
 
@@ -123,10 +149,15 @@ pub fn run_mapper_worker(
                         entry[acc_idx].update(&agg_row[row_idx]);
                     }
                 }
-                t_map += t2.elapsed();
+                
+                let t3 = read_cycle_counter();
+                c_map += t3.wrapping_sub(t2);
+                
+                // Reset regex start timer for the next loop iteration
+                t0 = read_cycle_counter();
             }
         } else {
-            // Normal Loop
+            // Normal Loop (Standard optimized path)
             for capture in line_re.captures_iter(&s) {
                 stats.matched_lines.fetch_add(1, Ordering::Relaxed);
                 
@@ -190,7 +221,14 @@ pub fn run_mapper_worker(
     }
 
     if enable_profiling {
-        println!("Thread Profile: Regex={:?} Parse={:?} Map={:?}", t_regex, t_parse, t_map);
+        // Convert to percentage
+        let total_cycles = c_regex + c_parse + c_map;
+        let p_regex = if total_cycles > 0 { (c_regex as f64 / total_cycles as f64) * 100.0 } else { 0.0 };
+        let p_parse = if total_cycles > 0 { (c_parse as f64 / total_cycles as f64) * 100.0 } else { 0.0 };
+        let p_map = if total_cycles > 0 { (c_map as f64 / total_cycles as f64) * 100.0 } else { 0.0 };
+        
+        println!("Thread Profile: Regex={:.1}% Parse={:.1}% Map={:.1}% (Total Cycles: {})", 
+            p_regex, p_parse, p_map, total_cycles);
     }
 
     map
