@@ -2,487 +2,34 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use regex::Regex;
-use rusqlite::{params, Connection, types::ValueRef};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
 use std::path::PathBuf;
-use std::sync::atomic::{Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
-// Import local modules
+// --- Modules ---
+mod config;
 mod io_splicer;
 mod stats;
+mod aggregation;
+mod database;
 
+use crate::config::{Cli, DisableConfig};
 use crate::io_splicer::{IoSplicer, SplicedChunk, SplicerConfig, SplicerStats};
-use crate::stats::{DbStats, RunMetadata};
-
-#[derive(Parser, Debug)]
-#[command(author, version, about)]
-// term_width = 0 means "Auto-detect terminal width".
-#[command(term_width = 0)] 
-struct Cli {
-    // --- Input Sources ---
-    /// Files or directories to scan. If directories, they are walked recursively.
-    #[arg(value_name = "INPUTS", help_heading = "Input Sources")]
-    inputs: Vec<PathBuf>,
-
-    /// Read list of files from Stdin.
-    #[arg(long = "files-from-stdin", help_heading = "Input Sources")]
-    files_from_stdin: bool,
-
-    /// Read file list from a specific file.
-    #[arg(long = "file-list", help_heading = "Input Sources")]
-    file_list: Option<PathBuf>,
-
-    /// Read content DATA directly from Stdin (no filename).
-    #[arg(long = "data-stdin", help_heading = "Input Sources")]
-    data_stdin: bool,
-
-
-    // --- Parsing Options ---
-    /// Regular Expression to parse lines.
-    /// Capturing groups are extracted into columns.
-    #[arg(short = 'r', long = "regex", help_heading = "Parsing Options")]
-    regex: String,
-
-    /// Optional: Regular Expression to parse File Paths.  
-    /// If provided, files not matching this regex are ignored.  
-    /// Capturing groups are extracted into columns.
-    #[arg(long = "path-regex", help_heading = "Parsing Options", verbatim_doc_comment)]
-    path_regex: Option<String>,
-
-    /// File path filter (regex) for directory walking. 
-    /// (Distinct from --path-regex, which extracts fields)
-    #[arg(short = 'f', long = "filter", help_heading = "Parsing Options", verbatim_doc_comment)]
-    filter_pattern: Option<String>,
-
-    /// Disable recursive directory walking
-    #[arg(long = "no-recursive", help_heading = "Parsing Options")]
-    no_recursive: bool,
-
-    /// Field mapping (e.g., "p1:host;l1:date"). 
-    /// Prefixes: 'p' for path capture groups, 'l' for line capture groups.
-    /// If omitted, defaults to pf_N (path) and lf_N (line) or f_N.
-    #[arg(short = 'F', long = "fields", help_heading = "Parsing Options", verbatim_doc_comment)]
-    field_map: Option<String>,
-    
-    /// Aggregation map definition (e.g. "1_k_i;2_k_s;5_s_i").
-    /// Mutually exclusive with Database mode.
-    /// Format: index_role_type separated by ;. 
-    /// Roles: k=Key, s=Sum, c=Count, x=Max, n=Min.
-    /// Types: i=i64, u=u64, f=f64, s=String.
-    #[arg(short = 'm', long = "map", help_heading = "Parsing Options")]
-    map_def: Option<String>,
-
-    /// Number of mapper threads to use for aggregation.
-    /// Defaults to half of available CPUs if not set.
-    #[arg(long = "map-threads", help_heading = "Performance")]
-    map_threads: Option<usize>,
-    
-    // --- Error Handling ---
-    /// Print error location (File, Offset, Capture Group) to stderr as it happens.
-    #[arg(short = 'e', long = "show-errors", help_heading = "Error Handling")]
-    show_errors: bool,
-
-    /// Stop processing immediately upon the first parse error.
-    #[arg(short = 'E', long = "stop-on-error", help_heading = "Error Handling")]
-    stop_on_error: bool,
-
-    // --- Performance Testing ---
-    /// Disable specific operations for profiling (comma separated):
-    /// regex (skip regex), maptarget (skip parsing), mapwrite (skip map insert)
-    #[arg(long = "disable-operations", help_heading = "Performance")]
-    disable_operations: Option<String>,
-
-
-    // --- Database Options ---
-    /// Database output file. Defaults to scan_HHMMSS.db
-    #[arg(long, help_heading = "Database Options")]
-    db_path: Option<String>,
-
-    /// Enable optional tracking tables (files, matches) to store full context
-    #[arg(long, help_heading = "Database Options")]
-    track_matches: bool,
-
-    /// Batch size for DB inserts
-    #[arg(long, default_value = "1000", help_heading = "Database Options")]
-    batch_size: usize,
-
-    /// SQLite Cache Size in MB
-    #[arg(long = "cache-mb", default_value_t = 100, help_heading = "Database Options")]
-    cache_mb: i64,
-
-
-    // --- SQL Hooks ---
-    /// Execute SQL string BEFORE scanning starts
-    #[arg(long = "pre-sql", help_heading = "SQL Hooks")]
-    pre_sql: Option<String>,
-
-    /// Execute SQL string AFTER scanning finishes
-    #[arg(long = "post-sql", help_heading = "SQL Hooks")]
-    post_sql: Option<String>,
-
-    /// Execute SQL script from file BEFORE scanning starts
-    #[arg(long = "pre-sql-file", help_heading = "SQL Hooks")]
-    pre_sql_file: Option<PathBuf>,
-
-    /// Execute SQL script from file AFTER scanning finishes
-    #[arg(long = "post-sql-file", help_heading = "SQL Hooks")]
-    post_sql_file: Option<PathBuf>,
-
-
-    // --- Performance/System ---
-    /// Stats ticker interval in milliseconds
-    #[arg(long = "ticker", default_value_t = 1000, help_heading = "Performance")]
-    ticker_interval: u64,
-
-    /// Number of file splicer threads
-    #[arg(short = 's', long = "splicers", help_heading = "Performance")]
-    splicer_threads: Option<usize>,
-
-    /// Number of regex parser threads (Only used in DB mode)
-    #[arg(short = 'p', long = "parsers", help_heading = "Performance")]
-    parser_threads: Option<usize>,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct DisableConfig {
-    regex: bool,
-    map_target: bool,
-    map_write: bool,
-}
-
-impl DisableConfig {
-    fn from_str(s: Option<&str>) -> Self {
-        let mut cfg = DisableConfig::default();
-        if let Some(s) = s {
-            for part in s.split(',') {
-                match part.trim() {
-                    "regex" => cfg.regex = true,
-                    "maptarget" => cfg.map_target = true,
-                    "mapwrite" => cfg.map_write = true,
-                    _ => {}
-                }
-            }
-        }
-        cfg
-    }
-}
-
-#[derive(Clone, Debug)]
-enum FieldSource {
-    Path(usize),
-    Line(usize),
-}
-
-#[derive(Clone, Debug)]
-struct ColumnDef {
-    name: String,
-    source: FieldSource,
-}
-
-enum DbRecord {
-    Data {
-        file_path: Option<Arc<PathBuf>>,
-        offset: u64,
-        line_content: String,
-        fields: Vec<Option<String>>,
-    },
-}
-
-// --- Map Mode Definitions ---
-
-#[derive(Clone, Debug, PartialEq, Copy)]
-enum AggRole { Key, Sum, Count, Max, Min }
-
-#[derive(Clone, Debug, PartialEq, Copy)]
-enum AggType { I64, U64, F64, Str }
-
-#[derive(Clone, Debug)]
-struct MapFieldSpec {
-    capture_index: usize,
-    role: AggRole,
-    dtype: AggType,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
-struct OrderedFloat(f64);
-impl Eq for OrderedFloat {}
-impl Ord for OrderedFloat {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.partial_cmp(&other.0).unwrap_or(std::cmp::Ordering::Equal)
-    }
-}
-impl std::fmt::Display for OrderedFloat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-#[derive(Clone, Debug, PartialOrd, PartialEq, Ord, Eq)]
-enum AggValue {
-    Null,
-    I64(i64),
-    U64(u64),
-    F64(OrderedFloat),
-    Str(String),
-}
-
-impl AggValue {
-    fn from_str(s: &str, t: AggType) -> Option<Self> {
-        if s.is_empty() { return Some(AggValue::Null); }
-        match t {
-            AggType::Str => Some(AggValue::Str(s.to_string())),
-            AggType::I64 => s.parse().ok().map(AggValue::I64),
-            AggType::U64 => s.parse().ok().map(AggValue::U64),
-            AggType::F64 => s.parse().ok().map(|f| AggValue::F64(OrderedFloat(f))),
-        }
-    }
-    
-    fn is_null(&self) -> bool {
-        matches!(self, AggValue::Null)
-    }
-}
-
-#[derive(Clone, Debug)]
-enum AggAccumulator {
-    SumI(i64),
-    SumU(u64),
-    SumF(f64),
-    Count(u64),
-    MaxI(i64),
-    MaxU(u64),
-    MaxF(f64),
-    MaxStr(String),
-    MinI(i64),
-    MinU(u64),
-    MinF(f64),
-    MinStr(String),
-    None,
-}
-
-impl AggAccumulator {
-    fn new(role: AggRole, dtype: AggType) -> Self {
-        match role {
-            AggRole::Sum => match dtype {
-                AggType::I64 => AggAccumulator::SumI(0),
-                AggType::U64 => AggAccumulator::SumU(0),
-                AggType::F64 => AggAccumulator::SumF(0.0),
-                _ => AggAccumulator::None,
-            },
-            AggRole::Count => AggAccumulator::Count(0),
-            AggRole::Max => match dtype {
-                AggType::I64 => AggAccumulator::MaxI(i64::MIN),
-                AggType::U64 => AggAccumulator::MaxU(u64::MIN),
-                AggType::F64 => AggAccumulator::MaxF(f64::MIN),
-                AggType::Str => AggAccumulator::MaxStr(String::new()),
-            },
-            AggRole::Min => match dtype {
-                AggType::I64 => AggAccumulator::MinI(i64::MAX),
-                AggType::U64 => AggAccumulator::MinU(u64::MAX),
-                AggType::F64 => AggAccumulator::MinF(f64::MAX),
-                AggType::Str => AggAccumulator::MinStr(String::new()), 
-            },
-            _ => AggAccumulator::None,
-        }
-    }
-
-    fn update(&mut self, val: &AggValue) {
-        if val.is_null() { return; }
-        match (self, val) {
-            (AggAccumulator::SumI(acc), AggValue::I64(v)) => *acc += v,
-            (AggAccumulator::SumU(acc), AggValue::U64(v)) => *acc += v,
-            (AggAccumulator::SumF(acc), AggValue::F64(v)) => *acc += v.0,
-            (AggAccumulator::Count(acc), _) => *acc += 1,
-            
-            (AggAccumulator::MaxI(acc), AggValue::I64(v)) => if *v > *acc { *acc = *v },
-            (AggAccumulator::MaxU(acc), AggValue::U64(v)) => if *v > *acc { *acc = *v },
-            (AggAccumulator::MaxF(acc), AggValue::F64(v)) => if v.0 > *acc { *acc = v.0 },
-            (AggAccumulator::MaxStr(acc), AggValue::Str(v)) => if v > acc { *acc = v.clone() },
-
-            (AggAccumulator::MinI(acc), AggValue::I64(v)) => if *v < *acc { *acc = *v },
-            (AggAccumulator::MinU(acc), AggValue::U64(v)) => if *v < *acc { *acc = *v },
-            (AggAccumulator::MinF(acc), AggValue::F64(v)) => if v.0 < *acc { *acc = v.0 },
-            (AggAccumulator::MinStr(acc), AggValue::Str(v)) => {
-                if acc.is_empty() || v < acc { *acc = v.clone() }
-            },
-            _ => {}
-        }
-    }
-
-    // Merge two accumulators from different threads
-    fn merge(&mut self, other: AggAccumulator) {
-        match (self, other) {
-            (AggAccumulator::SumI(a), AggAccumulator::SumI(b)) => *a += b,
-            (AggAccumulator::SumU(a), AggAccumulator::SumU(b)) => *a += b,
-            (AggAccumulator::SumF(a), AggAccumulator::SumF(b)) => *a += b,
-            (AggAccumulator::Count(a), AggAccumulator::Count(b)) => *a += b,
-            
-            (AggAccumulator::MaxI(a), AggAccumulator::MaxI(b)) => *a = (*a).max(b),
-            (AggAccumulator::MaxU(a), AggAccumulator::MaxU(b)) => *a = (*a).max(b),
-            (AggAccumulator::MaxF(a), AggAccumulator::MaxF(b)) => *a = if *a > b { *a } else { b },
-            (AggAccumulator::MaxStr(a), AggAccumulator::MaxStr(b)) => if b > *a { *a = b },
-
-            (AggAccumulator::MinI(a), AggAccumulator::MinI(b)) => *a = (*a).min(b),
-            (AggAccumulator::MinU(a), AggAccumulator::MinU(b)) => *a = (*a).min(b),
-            (AggAccumulator::MinF(a), AggAccumulator::MinF(b)) => *a = if *a < b { *a } else { b },
-            (AggAccumulator::MinStr(a), AggAccumulator::MinStr(b)) => {
-                if a.is_empty() || (!b.is_empty() && b < *a) { *a = b }
-            },
-            _ => {}
-        }
-    }
-}
-
-// --- End Map Definitions ---
-
-
-/// Helper to split SQL safely respecting quotes and comments
-fn split_sql_statements(sql: &str) -> Vec<String> {
-    let mut stmts = Vec::new();
-    let mut current = String::new();
-    let mut chars = sql.chars().peekable();
-    
-    // States
-    let mut in_quote = false;
-    let mut quote_char = '\0';
-    let mut in_line_comment = false;
-    let mut in_block_comment = false;
-
-    while let Some(c) = chars.next() {
-        current.push(c);
-
-        if in_line_comment {
-            if c == '\n' { in_line_comment = false; }
-        } else if in_block_comment {
-            if c == '*' && chars.peek() == Some(&'/') {
-                current.push(chars.next().unwrap());
-                in_block_comment = false;
-            }
-        } else if in_quote {
-            if c == quote_char {
-                // Check escape (doubled quote)
-                if chars.peek() == Some(&quote_char) {
-                    current.push(chars.next().unwrap());
-                } else {
-                    in_quote = false;
-                }
-            }
-        } else {
-            // Normal State
-            match c {
-                '\'' | '"' => {
-                    in_quote = true;
-                    quote_char = c;
-                },
-                '-' => {
-                    if chars.peek() == Some(&'-') {
-                        current.push(chars.next().unwrap());
-                        in_line_comment = true;
-                    }
-                },
-                '/' => {
-                    if chars.peek() == Some(&'*') {
-                        current.push(chars.next().unwrap());
-                        in_block_comment = true;
-                    }
-                },
-                ';' => {
-                    // Split point!
-                    let stmt = current.trim().to_string();
-                    if !stmt.is_empty() {
-                        stmts.push(stmt);
-                    }
-                    current = String::new();
-                },
-                _ => {}
-            }
-        }
-    }
-    
-    let stmt = current.trim().to_string();
-    if !stmt.is_empty() {
-        stmts.push(stmt);
-    }
-    stmts
-}
-
-fn execute_and_print_sql(conn: &Connection, sql_scripts: &[String], stage: &str) -> Result<()> {
-    for (i, script) in sql_scripts.iter().enumerate() {
-        if script.trim().is_empty() { continue; }
-        
-        let statements = split_sql_statements(script);
-        
-        if !statements.is_empty() {
-            println!("--- [Executing {} SQL Block #{} ({} statements)] ---", stage, i+1, statements.len());
-        }
-
-        for stmt_sql in statements {
-            let clean_sql = stmt_sql.trim_end_matches(';');
-            
-            let mut stmt = conn.prepare(clean_sql).context(format!("Failed to prepare SQL: {}", clean_sql))?;
-            
-            if stmt.column_count() > 0 {
-                let col_count = stmt.column_count();
-                let col_names: Vec<String> = (0..col_count).map(|i| stmt.column_name(i).unwrap_or("?").to_string()).collect();
-                
-                println!("> Query: {}", clean_sql);
-                println!("{}", col_names.join("\t"));
-                println!("{}", "-".repeat(col_names.len() * 10));
-
-                let mut rows = stmt.query([])?;
-                let mut row_count = 0;
-                while let Some(row) = rows.next()? {
-                    row_count += 1;
-                    let values: Vec<String> = (0..col_count).map(|i| {
-                        match row.get_ref(i).unwrap() {
-                            ValueRef::Null => "NULL".to_string(),
-                            ValueRef::Integer(i) => i.to_string(),
-                            ValueRef::Real(f) => f.to_string(),
-                            ValueRef::Text(t) => String::from_utf8_lossy(t).to_string(),
-                            ValueRef::Blob(_) => "<BLOB>".to_string(),
-                        }
-                    }).collect();
-                    println!("{}", values.join("\t"));
-                }
-                println!("({} rows)\n", row_count);
-            } else {
-                stmt.execute([])?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn parse_map_def(def: &str) -> Result<Vec<MapFieldSpec>> {
-    let mut specs = Vec::new();
-    for part in def.split(';') {
-        let tokens: Vec<&str> = part.split('_').collect();
-        if tokens.len() != 3 { anyhow::bail!("Invalid map spec: {}", part); }
-        let idx: usize = tokens[0].parse()?;
-        let role = match tokens[1] {
-            "k" => AggRole::Key,
-            "s" => AggRole::Sum,
-            "c" => AggRole::Count,
-            "x" => AggRole::Max,
-            "n" => AggRole::Min,
-            _ => anyhow::bail!("Unknown role: {}", tokens[1]),
-        };
-        let dtype = match tokens[2] {
-            "i" => AggType::I64,
-            "u" => AggType::U64,
-            "f" => AggType::F64,
-            "s" => AggType::Str,
-            _ => anyhow::bail!("Unknown type: {}", tokens[2]),
-        };
-        specs.push(MapFieldSpec { capture_index: idx, role, dtype });
-    }
-    Ok(specs)
-}
+use crate::stats::{DbStats, RunMetadata, get_cpu_time_seconds, get_iso_time};
+use crate::aggregation::{
+    AggRole, AggAccumulator, AggValue, MapFieldSpec, 
+    parse_map_def, print_map_results
+};
+use crate::database::{
+    DbRecord, ColumnDef, FieldSource, run_db_worker, execute_and_print_sql
+};
 
 struct DisableFlags {
     regex: bool,
@@ -651,7 +198,7 @@ fn main() -> Result<()> {
     let run_meta = RunMetadata {
         regex: cli.regex.clone(),
         command_args: command_line,
-        created_at: stats::get_iso_time(),
+        created_at: get_iso_time(),
         cache_mb: cli.cache_mb,
         pre_sql: pre_sql_scripts,
         post_sql: post_sql_scripts,
@@ -670,6 +217,7 @@ fn main() -> Result<()> {
 
         let show_errors = cli.show_errors;
         let stop_on_error = cli.stop_on_error;
+        let enable_profiling = cli.profile;
         let flags = Arc::new(disable_flags);
 
         for _ in 0..map_thread_count {
@@ -681,7 +229,7 @@ fn main() -> Result<()> {
             let t_flags = flags.clone();
             
             map_handles.push(thread::spawn(move || {
-                run_mapper_worker(rx, r_tx, specs, l_re, stats, show_errors, stop_on_error, t_flags)
+                run_mapper_worker(rx, r_tx, specs, l_re, stats, show_errors, stop_on_error, enable_profiling, t_flags)
             }));
         }
 
@@ -814,13 +362,12 @@ fn main() -> Result<()> {
         for h in map_handles {
             let sub_map = h.join().unwrap();
             for (key, val) in sub_map {
-                use std::collections::btree_map::Entry;
                 match final_map.entry(key) {
                     Entry::Vacant(e) => {
                         e.insert(val);
                     },
-                    Entry::Occupied(e) => {
-                        let existing = e.into_mut();
+                    Entry::Occupied(mut e) => {
+                        let existing = e.get_mut();
                         for (acc, other) in existing.iter_mut().zip(val.into_iter()) {
                             acc.merge(other);
                         }
@@ -834,7 +381,7 @@ fn main() -> Result<()> {
 
     // Final Stats
     let duration = start_time.elapsed().as_secs_f64();
-    let cpu_seconds = stats::get_cpu_time_seconds(); // Get CPU time
+    let cpu_seconds = get_cpu_time_seconds();
     let files = splicer_stats.file_count.load(Ordering::Relaxed);
     let skipped = splicer_stats.skipped_count.load(Ordering::Relaxed);
     let bytes = db_stats.bytes_processed.load(Ordering::Relaxed);
@@ -861,8 +408,8 @@ fn main() -> Result<()> {
 
     if parse_errors > 0 {
         println!("\n--- Parse Errors by Field Index ---");
-        // DashMap does not support ordered iteration easily, copy to vec
-        let mut err_list: Vec<_> = db_stats.error_counts.iter().map(|r| (*r.key(), *r.value())).collect();
+        // FIXED: Explicit type annotation for DashMap iterator
+        let mut err_list: Vec<(usize, usize)> = db_stats.error_counts.iter().map(|r| (*r.key(), *r.value())).collect();
         err_list.sort_by_key(|k| k.0);
         for (idx, count) in err_list {
             println!("Capture Group {}: {} errors", idx, count);
@@ -882,11 +429,17 @@ fn run_mapper_worker(
     stats: Arc<DbStats>,
     show_errors: bool,
     stop_on_error: bool,
+    enable_profiling: bool, // FIX: Argument is now here
     disable_flags: Arc<DisableFlags>,
 ) -> BTreeMap<Vec<AggValue>, Vec<AggAccumulator>> {
     
     let mut map: BTreeMap<Vec<AggValue>, Vec<AggAccumulator>> = BTreeMap::new();
     
+    // Performance timers
+    let mut t_regex = Duration::ZERO;
+    let mut t_parse = Duration::ZERO;
+    let mut t_map = Duration::ZERO;
+
     // Pre-calculate indices
     let mut key_indices = Vec::new();
     let mut val_indices = Vec::new();
@@ -912,67 +465,143 @@ fn run_mapper_worker(
         
         let s = String::from_utf8_lossy(&data);
         
-        // Normal Loop
-        for capture in line_re.captures_iter(&s) {
-            stats.matched_lines.fetch_add(1, Ordering::Relaxed);
-            
-            if disable_flags.maptarget { continue; }
+        // Decide loop type based on profiling
+        if enable_profiling {
+            let t0 = Instant::now();
+            for capture in line_re.captures_iter(&s) {
+                let t1 = Instant::now();
+                t_regex += t1 - t0;
 
-            let mut agg_row = Vec::with_capacity(specs.len());
-            let mut row_has_error = false;
-            
-            // Calculate line offset for error reporting
-            let match_start = capture.get(0).map(|m| m.start()).unwrap_or(0);
-            let abs_offset = chunk_offset + match_start as u64;
+                stats.matched_lines.fetch_add(1, Ordering::Relaxed);
 
-            for spec in &specs {
-                let raw = capture.get(spec.capture_index).map(|m| m.as_str()).unwrap_or("");
-                match AggValue::from_str(raw, spec.dtype) {
-                    Some(val) => agg_row.push(val),
-                    None => {
-                        row_has_error = true;
-                        stats.total_errors.fetch_add(1, Ordering::Relaxed);
-                        *stats.error_counts.entry(spec.capture_index).or_default() += 1;
+                if disable_flags.maptarget {
+                    continue;
+                }
+                
+                let mut agg_row = Vec::with_capacity(specs.len());
+                let mut row_has_error = false;
+                
+                let match_start = capture.get(0).map(|m| m.start()).unwrap_or(0);
+                let abs_offset = chunk_offset + match_start as u64;
 
-                        if show_errors || stop_on_error {
-                            eprintln!("Parse Error at {}:{} (Capture Group {}): Failed to parse '{}' as {:?}", 
-                                path_display, abs_offset, spec.capture_index, raw, spec.dtype);
-                        }
-                        if stop_on_error {
-                            eprintln!("Stopping due to error (-E flag).");
-                            std::process::exit(1); 
+                for spec in &specs {
+                    let raw = capture.get(spec.capture_index).map(|m| m.as_str()).unwrap_or("");
+                    match AggValue::from_str(raw, spec.dtype) {
+                        Some(val) => agg_row.push(val),
+                        None => {
+                            row_has_error = true;
+                            stats.total_errors.fetch_add(1, Ordering::Relaxed);
+                            *stats.error_counts.entry(spec.capture_index).or_default() += 1;
+
+                            if show_errors || stop_on_error {
+                                eprintln!("Parse Error at {}:{} (Capture Group {}): Failed to parse '{}' as {:?}", 
+                                    path_display, abs_offset, spec.capture_index, raw, spec.dtype);
+                            }
+                            if stop_on_error {
+                                eprintln!("Stopping due to error (-E flag).");
+                                std::process::exit(1); 
+                            }
                         }
                     }
                 }
+                
+                let t2 = Instant::now();
+                t_parse += t2 - t1;
+
+                if row_has_error { continue; }
+
+                if disable_flags.mapwrite {
+                    continue;
+                }
+
+                let mut key = Vec::with_capacity(key_indices.len());
+                let mut key_valid = true;
+                for &idx in &key_indices {
+                    let v = &agg_row[idx];
+                    if v.is_null() { key_valid = false; break; }
+                    key.push(v.clone());
+                }
+
+                if key_valid {
+                    stats.mapped_records.fetch_add(1, Ordering::Relaxed);
+                    let entry = map.entry(key).or_insert_with(|| {
+                        val_indices.iter().map(|&i| {
+                            AggAccumulator::new(specs[i].role, specs[i].dtype)
+                        }).collect()
+                    });
+                    for (acc_idx, &row_idx) in val_indices.iter().enumerate() {
+                        entry[acc_idx].update(&agg_row[row_idx]);
+                    }
+                }
+                t_map += t2.elapsed();
             }
+        } else {
+            // Normal Loop
+            for capture in line_re.captures_iter(&s) {
+                stats.matched_lines.fetch_add(1, Ordering::Relaxed);
+                
+                if disable_flags.maptarget { continue; }
 
-            if row_has_error { continue; }
+                let mut agg_row = Vec::with_capacity(specs.len());
+                let mut row_has_error = false;
+                
+                // Calculate line offset for error reporting
+                let match_start = capture.get(0).map(|m| m.start()).unwrap_or(0);
+                let abs_offset = chunk_offset + match_start as u64;
 
-            if disable_flags.mapwrite { continue; }
+                for spec in &specs {
+                    let raw = capture.get(spec.capture_index).map(|m| m.as_str()).unwrap_or("");
+                    match AggValue::from_str(raw, spec.dtype) {
+                        Some(val) => agg_row.push(val),
+                        None => {
+                            row_has_error = true;
+                            stats.total_errors.fetch_add(1, Ordering::Relaxed);
+                            *stats.error_counts.entry(spec.capture_index).or_default() += 1;
 
-            let mut key = Vec::with_capacity(key_indices.len());
-            let mut key_valid = true;
-            for &idx in &key_indices {
-                let v = &agg_row[idx];
-                if v.is_null() { key_valid = false; break; }
-                key.push(v.clone());
-            }
+                            if show_errors || stop_on_error {
+                                eprintln!("Parse Error at {}:{} (Capture Group {}): Failed to parse '{}' as {:?}", 
+                                    path_display, abs_offset, spec.capture_index, raw, spec.dtype);
+                            }
+                            if stop_on_error {
+                                eprintln!("Stopping due to error (-E flag).");
+                                std::process::exit(1); 
+                            }
+                        }
+                    }
+                }
 
-            if key_valid {
-                stats.mapped_records.fetch_add(1, Ordering::Relaxed);
-                let entry = map.entry(key).or_insert_with(|| {
-                    val_indices.iter().map(|&i| {
-                        AggAccumulator::new(specs[i].role, specs[i].dtype)
-                    }).collect()
-                });
-                for (acc_idx, &row_idx) in val_indices.iter().enumerate() {
-                    entry[acc_idx].update(&agg_row[row_idx]);
+                if row_has_error { continue; }
+
+                if disable_flags.mapwrite { continue; }
+
+                let mut key = Vec::with_capacity(key_indices.len());
+                let mut key_valid = true;
+                for &idx in &key_indices {
+                    let v = &agg_row[idx];
+                    if v.is_null() { key_valid = false; break; }
+                    key.push(v.clone());
+                }
+
+                if key_valid {
+                    stats.mapped_records.fetch_add(1, Ordering::Relaxed);
+                    let entry = map.entry(key).or_insert_with(|| {
+                        val_indices.iter().map(|&i| {
+                            AggAccumulator::new(specs[i].role, specs[i].dtype)
+                        }).collect()
+                    });
+                    for (acc_idx, &row_idx) in val_indices.iter().enumerate() {
+                        entry[acc_idx].update(&agg_row[row_idx]);
+                    }
                 }
             }
         }
 
         data.clear();
         let _ = recycle_tx.send(data);
+    }
+
+    if enable_profiling {
+        println!("Thread Profile: Regex={:?} Parse={:?} Map={:?}", t_regex, t_parse, t_map);
     }
 
     map
@@ -1065,235 +694,4 @@ fn run_db_parser(
         data.clear();
         let _ = recycle_tx.send(data);
     }
-}
-
-
-fn print_map_results(map: BTreeMap<Vec<AggValue>, Vec<AggAccumulator>>, specs: Vec<MapFieldSpec>) {
-    println!("\n--- Aggregation Map Results ---");
-    
-    let mut key_indices = Vec::new();
-    let mut val_indices = Vec::new();
-    for (i, spec) in specs.iter().enumerate() {
-        if spec.role == AggRole::Key { key_indices.push(i); } 
-        else { val_indices.push(i); }
-    }
-
-    // Header
-    let mut headers = Vec::new();
-    for &i in &key_indices { headers.push(format!("Key_{}", specs[i].capture_index)); }
-    for &i in &val_indices { headers.push(format!("{:?}_{}", specs[i].role, specs[i].capture_index)); }
-    println!("{}", headers.join("\t"));
-
-    for (key, values) in map {
-        let mut parts = Vec::new();
-        for k in key {
-            match k {
-                AggValue::I64(v) => parts.push(v.to_string()),
-                AggValue::U64(v) => parts.push(v.to_string()),
-                AggValue::F64(v) => parts.push(v.0.to_string()),
-                AggValue::Str(v) => parts.push(v),
-                AggValue::Null => parts.push("".to_string()),
-            }
-        }
-        for v in values {
-            match v {
-                AggAccumulator::SumI(x) => parts.push(x.to_string()),
-                AggAccumulator::SumU(x) => parts.push(x.to_string()),
-                AggAccumulator::SumF(x) => parts.push(x.to_string()),
-                AggAccumulator::Count(x) => parts.push(x.to_string()),
-                AggAccumulator::MaxI(x) => parts.push(x.to_string()),
-                AggAccumulator::MaxU(x) => parts.push(x.to_string()),
-                AggAccumulator::MaxF(x) => parts.push(x.to_string()),
-                AggAccumulator::MaxStr(x) => parts.push(x),
-                AggAccumulator::MinI(x) => parts.push(x.to_string()),
-                AggAccumulator::MinU(x) => parts.push(x.to_string()),
-                AggAccumulator::MinF(x) => parts.push(x.to_string()),
-                AggAccumulator::MinStr(x) => parts.push(x),
-                AggAccumulator::None => parts.push("".to_string()),
-            }
-        }
-        println!("{}", parts.join("\t"));
-    }
-    println!("-------------------------------");
-}
-
-fn run_db_worker(
-    path: String, 
-    rx: Receiver<DbRecord>, 
-    batch_size: usize,
-    track_matches: bool,
-    columns: Vec<String>,
-    stats: Arc<DbStats>,
-    splicer_stats: Arc<SplicerStats>,
-    meta: RunMetadata,
-) -> Result<i64> {
-    let mut conn = Connection::open(path)?;
-    
-    // Performance Tunings
-    conn.execute_batch("
-        PRAGMA synchronous = OFF;
-        PRAGMA journal_mode = MEMORY;
-        PRAGMA temp_store = 2;
-    ")?;
-    
-    // Set Cache Size
-    let cache_kib = meta.cache_mb * 1024;
-    let cache_pragma = format!("PRAGMA cache_size = -{};", cache_kib); // Negative means KiB
-    conn.execute(&cache_pragma, [])?;
-
-    // --- PRE-RUN SQL ---
-    if !meta.pre_sql.is_empty() {
-        execute_and_print_sql(&conn, &meta.pre_sql, "PRE")?;
-    }
-
-    // 1. Setup Shared Tables
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS runs (
-            id INTEGER PRIMARY KEY,
-            timestamp TEXT,
-            command TEXT,
-            regex TEXT,
-            files_processed INTEGER DEFAULT 0,
-            files_skipped INTEGER DEFAULT 0,
-            bytes_processed INTEGER DEFAULT 0,
-            match_count INTEGER DEFAULT 0,
-            finished_at TEXT
-        )", 
-        [],
-    )?;
-    conn.execute("INSERT INTO runs (timestamp, command, regex) VALUES (?, ?, ?)",
-        params![meta.created_at, meta.command_args, meta.regex])?;
-    let run_id = conn.last_insert_rowid();
-
-    let _ = conn.execute("ALTER TABLE files ADD COLUMN run_id INTEGER", []);
-    conn.execute("CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY, run_id INTEGER, path TEXT)", [])?;
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_files_run_path ON files(run_id, path)", [])?;
-
-    // 2. Setup Dynamic Tables
-    let data_table_name = format!("data_{}", run_id);
-    let matches_table_name = format!("matches_{}", run_id);
-
-    if track_matches {
-        conn.execute(&format!("CREATE TABLE {} (id INTEGER PRIMARY KEY, file_id INTEGER, offset INTEGER, content TEXT)", matches_table_name), [])?;
-    }
-
-    let mut col_defs = String::new();
-    for col in &columns { col_defs.push_str(&format!(", {} TEXT", col)); }
-    let match_id_col = if track_matches { ", match_id INTEGER" } else { "" };
-    
-    conn.execute(&format!("CREATE TABLE {} (id INTEGER PRIMARY KEY, run_id INTEGER, file_id INTEGER{}{})", 
-        data_table_name, match_id_col, col_defs), [])?;
-
-    // 3. Process Data
-    let mut file_cache: HashMap<PathBuf, i64> = HashMap::new();
-    let mut batch = Vec::with_capacity(batch_size);
-    
-    while let Ok(msg) = rx.recv() {
-        batch.push(msg);
-        if batch.len() >= batch_size {
-            flush_batch(&mut conn, &mut batch, &mut file_cache, track_matches, &columns, &stats, &data_table_name, &matches_table_name, run_id)?;
-        }
-    }
-    if !batch.is_empty() {
-        flush_batch(&mut conn, &mut batch, &mut file_cache, track_matches, &columns, &stats, &data_table_name, &matches_table_name, run_id)?;
-    }
-
-    // Update Runs with Final Stats
-    let final_files = splicer_stats.file_count.load(Ordering::Relaxed);
-    let final_skipped = splicer_stats.skipped_count.load(Ordering::Relaxed);
-    let final_bytes = stats.bytes_processed.load(Ordering::Relaxed);
-    let final_matches = stats.matched_lines.load(Ordering::Relaxed);
-    let finished_at = stats::get_iso_time();
-
-    conn.execute("UPDATE runs SET files_processed = ?, files_skipped = ?, bytes_processed = ?, match_count = ?, finished_at = ? WHERE id = ?",
-        params![final_files, final_skipped, final_bytes, final_matches, finished_at, run_id])?;
-
-
-    // --- CREATE LATEST VIEWS ---
-    let _ = conn.execute("DROP VIEW IF EXISTS data", []);
-    let create_view = format!("CREATE VIEW data AS SELECT * FROM {}", data_table_name);
-    if let Err(e) = conn.execute(&create_view, []) {
-        eprintln!("Warning: Could not create 'data' view: {}", e);
-    }
-    
-    if track_matches {
-        let _ = conn.execute("DROP VIEW IF EXISTS matches", []);
-        let create_view = format!("CREATE VIEW matches AS SELECT * FROM {}", matches_table_name);
-         let _ = conn.execute(&create_view, []);
-    }
-
-    // --- POST-RUN SQL ---
-    if !meta.post_sql.is_empty() {
-        execute_and_print_sql(&conn, &meta.post_sql, "POST")?;
-    }
-
-    Ok(run_id)
-}
-
-fn flush_batch(
-    conn: &mut Connection, 
-    batch: &mut Vec<DbRecord>, 
-    file_cache: &mut HashMap<PathBuf, i64>,
-    track_matches: bool,
-    columns: &[String],
-    stats: &Arc<DbStats>,
-    data_table: &str,
-    matches_table: &str,
-    run_id: i64,
-) -> Result<()> {
-    let tx = conn.transaction()?;
-    
-    for record in batch.drain(..) {
-        let DbRecord::Data { file_path, offset, line_content, fields } = record;
-            
-        let mut current_match_id = None;
-
-        let file_id = if let Some(p) = &file_path {
-            if let Some(&id) = file_cache.get(&**p) {
-                id
-            } else {
-                let path_str = p.to_string_lossy();
-                tx.execute("INSERT OR IGNORE INTO files (run_id, path) VALUES (?, ?)", params![run_id, path_str])?;
-                let mut stmt = tx.prepare("SELECT id FROM files WHERE run_id = ? AND path = ?")?;
-                let id: i64 = stmt.query_row(params![run_id, path_str], |row| row.get(0))?;
-                file_cache.insert((**p).clone(), id);
-                id
-            }
-        } else { 0 };
-
-        if track_matches {
-            let sql = format!("INSERT INTO {} (file_id, offset, content) VALUES (?, ?, ?)", matches_table);
-            tx.execute(&sql, params![file_id, offset as i64, line_content])?;
-            current_match_id = Some(tx.last_insert_rowid());
-        }
-
-        let mut place_holders = String::new();
-        let mut values: Vec<String> = Vec::new();
-        
-        place_holders.push_str("?, ?, ");
-        values.push(run_id.to_string());
-        values.push(file_id.to_string());
-
-        if track_matches {
-            place_holders.push_str("?, ");
-            values.push(current_match_id.unwrap().to_string());
-        }
-
-        for (i, field) in fields.iter().enumerate() {
-            if i > 0 { place_holders.push_str(", "); }
-            place_holders.push_str("?");
-            values.push(field.clone().unwrap_or_default());
-        }
-
-        let match_col = if track_matches { "match_id, " } else { "" };
-        let col_names = columns.join(", ");
-        let sql = format!("INSERT INTO {} (run_id, file_id, {}{}) VALUES ({})", data_table, match_col, col_names, place_holders);
-        let params_refs: Vec<&dyn rusqlite::ToSql> = values.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-        tx.execute(&sql, &*params_refs)?;
-        
-        stats.committed_records.fetch_add(1, Ordering::Relaxed);
-    }
-
-    tx.commit()?;
-    Ok(())
 }
