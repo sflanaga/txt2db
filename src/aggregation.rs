@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Copy)]
-pub enum AggRole { Key, Sum, Count, Max, Min }
+pub enum AggRole { Key, Sum, Count, Max, Min, Avg }
 
 #[derive(Clone, Debug, PartialEq, Copy)]
 pub enum AggType { I64, U64, F64, Str }
@@ -67,6 +67,9 @@ pub enum AggAccumulator {
     MinU(u64),
     MinF(f64),
     MinStr(String),
+    AvgI { sum: i64, count: u64 },
+    AvgU { sum: u64, count: u64 },
+    AvgF { sum: f64, count: u64 },
     None,
 }
 
@@ -92,6 +95,12 @@ impl AggAccumulator {
                 AggType::F64 => AggAccumulator::MinF(f64::MAX),
                 AggType::Str => AggAccumulator::MinStr(String::new()), 
             },
+            AggRole::Avg => match dtype {
+                AggType::I64 => AggAccumulator::AvgI { sum: 0, count: 0 },
+                AggType::U64 => AggAccumulator::AvgU { sum: 0, count: 0 },
+                AggType::F64 => AggAccumulator::AvgF { sum: 0.0, count: 0 },
+                _ => AggAccumulator::None,
+            },
             _ => AggAccumulator::None,
         }
     }
@@ -115,6 +124,10 @@ impl AggAccumulator {
             (AggAccumulator::MinStr(acc), AggValue::Str(v)) => {
                 if acc.is_empty() || v < acc { *acc = v.clone() }
             },
+
+            (AggAccumulator::AvgI { sum, count }, AggValue::I64(v)) => { *sum += v; *count += 1; },
+            (AggAccumulator::AvgU { sum, count }, AggValue::U64(v)) => { *sum += v; *count += 1; },
+            (AggAccumulator::AvgF { sum, count }, AggValue::F64(v)) => { *sum += v.0; *count += 1; },
             _ => {}
         }
     }
@@ -138,6 +151,16 @@ impl AggAccumulator {
             (AggAccumulator::MinStr(a), AggAccumulator::MinStr(b)) => {
                 if a.is_empty() || (!b.is_empty() && b < *a) { *a = b }
             },
+
+            (AggAccumulator::AvgI { sum: sa, count: ca }, AggAccumulator::AvgI { sum: sb, count: cb }) => {
+                *sa += sb; *ca += cb;
+            },
+            (AggAccumulator::AvgU { sum: sa, count: ca }, AggAccumulator::AvgU { sum: sb, count: cb }) => {
+                *sa += sb; *ca += cb;
+            },
+            (AggAccumulator::AvgF { sum: sa, count: ca }, AggAccumulator::AvgF { sum: sb, count: cb }) => {
+                *sa += sb; *ca += cb;
+            },
             _ => {}
         }
     }
@@ -155,6 +178,7 @@ pub fn parse_map_def(def: &str) -> Result<Vec<MapFieldSpec>> {
             "c" => AggRole::Count,
             "x" => AggRole::Max,
             "n" => AggRole::Min,
+            "a" => AggRole::Avg,
             _ => anyhow::bail!("Unknown role: {}", tokens[1]),
         };
         let dtype = match tokens[2] {
@@ -210,6 +234,15 @@ pub fn print_map_results(map: BTreeMap<Vec<AggValue>, Vec<AggAccumulator>>, spec
                 AggAccumulator::MinU(x) => parts.push(x.to_string()),
                 AggAccumulator::MinF(x) => parts.push(x.to_string()),
                 AggAccumulator::MinStr(x) => parts.push(x),
+                AggAccumulator::AvgI { sum, count } => {
+                    if count > 0 { parts.push((sum as f64 / count as f64).to_string()) } else { parts.push(String::new()) }
+                },
+                AggAccumulator::AvgU { sum, count } => {
+                    if count > 0 { parts.push((sum as f64 / count as f64).to_string()) } else { parts.push(String::new()) }
+                },
+                AggAccumulator::AvgF { sum, count } => {
+                    if count > 0 { parts.push((sum / count as f64).to_string()) } else { parts.push(String::new()) }
+                },
                 AggAccumulator::None => parts.push("".to_string()),
             }
         }

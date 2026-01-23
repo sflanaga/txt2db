@@ -59,7 +59,7 @@ pub struct Cli {
     /// Aggregation map definition (e.g. "1_k_i;2_k_s;5_s_i").
     /// Mutually exclusive with Database mode.
     /// Format: index_role_type separated by ;. 
-    /// Roles: k=Key, s=Sum, c=Count, x=Max, n=Min.
+    /// Roles: k=Key, s=Sum, c=Count, x=Max, n=Min, a=Avg.
     /// Types: i=i64, u=u64, f=f64, s=String.
     #[arg(short = 'm', long = "map", help_heading = "Parsing Options", verbatim_doc_comment)]
     pub map_def: Option<String>,
