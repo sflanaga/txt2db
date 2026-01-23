@@ -37,7 +37,7 @@ pub struct SplicerStats {
     pub byte_count: AtomicUsize,
     pub chunk_count: AtomicUsize,
     pub paths_queued: AtomicIsize,
-    
+
     pub recycler_miss_count: AtomicUsize,
     pub buffer_realloc_count: AtomicUsize,
     pub newline_split_count: AtomicUsize,
@@ -83,7 +83,11 @@ impl IoSplicer {
         I: Iterator<Item = PathBuf> + Send,
     {
         let (path_tx, path_rx) = bounded::<PathBuf>(1024);
-        let num_threads = if self.config.thread_count > 0 { self.config.thread_count } else { 4 };
+        let num_threads = if self.config.thread_count > 0 {
+            self.config.thread_count
+        } else {
+            4
+        };
 
         thread::scope(|s| {
             s.spawn(move || {
@@ -101,7 +105,9 @@ impl IoSplicer {
 
                     if matches_filter {
                         self.stats.paths_queued.fetch_add(1, Ordering::Relaxed);
-                        if path_tx.send(path).is_err() { break; }
+                        if path_tx.send(path).is_err() {
+                            break;
+                        }
                     } else {
                         self.stats.skipped_count.fetch_add(1, Ordering::Relaxed);
                     }
@@ -128,10 +134,10 @@ impl IoSplicer {
             Ok(f) => f,
             Err(_) => return Ok(()),
         };
-        
+
         self.stats.file_count.fetch_add(1, Ordering::Relaxed);
         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-        
+
         let path_arc = Some(Arc::new(path.to_path_buf()));
 
         match ext {
@@ -144,7 +150,7 @@ impl IoSplicer {
 
     fn process_reader<R: Read>(&self, mut reader: R, path: Option<Arc<PathBuf>>) -> Result<()> {
         let mut buffer = Vec::with_capacity(self.config.max_buffer_size);
-        let mut read_buf = vec![0u8; 128 * 1024]; 
+        let mut read_buf = vec![0u8; 128 * 1024];
         let mut current_offset: u64 = 0;
 
         loop {
@@ -153,27 +159,37 @@ impl IoSplicer {
                 break;
             }
 
-            self.stats.byte_count.fetch_add(bytes_read, Ordering::Relaxed);
+            self.stats
+                .byte_count
+                .fetch_add(bytes_read, Ordering::Relaxed);
             buffer.extend_from_slice(&read_buf[..bytes_read]);
 
             while buffer.len() >= self.config.chunk_size {
                 let search_limit = std::cmp::min(buffer.len(), self.config.max_buffer_size);
                 let slice_to_check = &buffer[..search_limit];
-                
+
                 if let Some(last_newline_idx) = slice_to_check.iter().rposition(|&b| b == b'\n') {
-                    self.stats.newline_split_count.fetch_add(1, Ordering::Relaxed);
-                    
+                    self.stats
+                        .newline_split_count
+                        .fetch_add(1, Ordering::Relaxed);
+
                     let split_len = last_newline_idx + 1;
                     self.emit_chunk(&buffer[..split_len], path.clone(), current_offset)?;
-                    
+
                     buffer.drain(..split_len);
                     current_offset += split_len as u64;
                 } else {
                     if buffer.len() >= self.config.max_buffer_size {
-                        self.stats.forced_split_count.fetch_add(1, Ordering::Relaxed);
-                        
-                        self.emit_chunk(&buffer[..self.config.max_buffer_size], path.clone(), current_offset)?;
-                        
+                        self.stats
+                            .forced_split_count
+                            .fetch_add(1, Ordering::Relaxed);
+
+                        self.emit_chunk(
+                            &buffer[..self.config.max_buffer_size],
+                            path.clone(),
+                            current_offset,
+                        )?;
+
                         buffer.drain(..self.config.max_buffer_size);
                         current_offset += self.config.max_buffer_size as u64;
                     } else {
@@ -195,25 +211,29 @@ impl IoSplicer {
             Ok(mut b) => {
                 b.clear();
                 b
-            },
+            }
             Err(_) => {
-                self.stats.recycler_miss_count.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .recycler_miss_count
+                    .fetch_add(1, Ordering::Relaxed);
                 Vec::with_capacity(bytes.len())
             }
         };
 
         if v.capacity() < bytes.len() {
-            self.stats.buffer_realloc_count.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .buffer_realloc_count
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         v.extend_from_slice(bytes);
-        
+
         let chunk = SplicedChunk {
             data: v,
             file_path: path,
             offset,
         };
-        
+
         self.sender.send(chunk).context("Receiver dropped")?;
         self.stats.chunk_count.fetch_add(1, Ordering::Relaxed);
         Ok(())

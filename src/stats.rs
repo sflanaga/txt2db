@@ -7,12 +7,12 @@ use std::time::SystemTime;
 pub struct DbStats {
     pub matched_lines: AtomicUsize,
     pub committed_records: AtomicUsize,
-    pub mapped_records: AtomicUsize, 
+    pub mapped_records: AtomicUsize,
     pub bytes_processed: AtomicUsize,
     // Error tracking
     pub total_errors: AtomicUsize,
     // Map of Capture Index -> Count
-    pub error_counts: DashMap<usize, usize>, 
+    pub error_counts: DashMap<usize, usize>,
 }
 
 pub struct RunMetadata {
@@ -29,10 +29,12 @@ pub fn get_iso_time() -> String {
         .args(["-u", "+%Y-%m-%d %H:%M:%S.%3N"])
         .output()
         .ok();
-    
+
     if let Some(o) = output {
         let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-        if !s.is_empty() { return s; }
+        if !s.is_empty() {
+            return s;
+        }
     }
     format!("{:?}", SystemTime::now())
 }
@@ -46,8 +48,8 @@ pub fn get_cpu_time_seconds() -> f64 {
             let utime: f64 = parts[13].parse().unwrap_or(0.0);
             let stime: f64 = parts[14].parse().unwrap_or(0.0);
             // Default Linux ticks per second is usually 100
-            let ticks_per_sec = 100.0; 
-            return (utime + stime) / ticks_per_sec; 
+            let ticks_per_sec = 100.0;
+            return (utime + stime) / ticks_per_sec;
         }
     }
     0.0

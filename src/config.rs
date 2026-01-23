@@ -4,7 +4,7 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(author, version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_INFO"), ")"), about)]
 // term_width = 0 means "Auto-detect terminal width".
-#[command(term_width = 0)] 
+#[command(term_width = 0)]
 pub struct Cli {
     // --- Input Sources ---
     /// Files or directories to scan. If directories, they are walked recursively.
@@ -23,7 +23,6 @@ pub struct Cli {
     #[arg(long = "data-stdin", help_heading = "Input Sources")]
     pub data_stdin: bool,
 
-
     // --- Parsing Options ---
     /// Regular Expression to parse lines.
     /// Capturing groups are extracted into columns.
@@ -38,37 +37,60 @@ pub struct Cli {
     /// Optional: Regular Expression to parse File Paths.  
     /// If provided, files not matching this regex are ignored.  
     /// Capturing groups are extracted into columns.
-    #[arg(long = "path-regex", help_heading = "Parsing Options", verbatim_doc_comment)]
+    #[arg(
+        long = "path-regex",
+        help_heading = "Parsing Options",
+        verbatim_doc_comment
+    )]
     pub path_regex: Option<String>,
 
-    /// File path filter (regex) for directory walking. 
+    /// File path filter (regex) for directory walking.
     /// (Distinct from --path-regex, which extracts fields)
-    #[arg(short = 'f', long = "filter", help_heading = "Parsing Options", verbatim_doc_comment)]
+    #[arg(
+        short = 'f',
+        long = "filter",
+        help_heading = "Parsing Options",
+        verbatim_doc_comment
+    )]
     pub filter_pattern: Option<String>,
 
     /// Disable recursive directory walking
     #[arg(long = "no-recursive", help_heading = "Parsing Options")]
     pub no_recursive: bool,
 
-    /// Field mapping (e.g., "p1:host;l1:date"). 
+    /// Field mapping (e.g., "p1:host;l1:date").
     /// Prefixes: 'p' for path capture groups, 'l' for line capture groups.
     /// If omitted, defaults to pf_N (path) and lf_N (line) or f_N.
-    #[arg(short = 'F', long = "fields", help_heading = "Parsing Options", verbatim_doc_comment)]
+    #[arg(
+        short = 'F',
+        long = "fields",
+        help_heading = "Parsing Options",
+        verbatim_doc_comment
+    )]
     pub field_map: Option<String>,
-    
+
     /// Aggregation map definition (e.g. "1_k_i;2_k_s;5_s_i"; supports path captures like "p1_k_s").
     /// Mutually exclusive with Database mode.
-    /// Format: index_role_type separated by ;. 
+    /// Format: index_role_type separated by ;.
     /// Roles: k=Key, s=Sum, c=Count, x=Max, n=Min, a=Avg.
     /// Types: i=i64, u=u64, f=f64, s=String.
-    #[arg(short = 'm', long = "map", help_heading = "Parsing Options", verbatim_doc_comment)]
+    #[arg(
+        short = 'm',
+        long = "map",
+        help_heading = "Parsing Options",
+        verbatim_doc_comment
+    )]
     pub map_def: Option<String>,
 
     /// Number of mapper threads to use for aggregation.
     /// Defaults to half of available CPUs if not set.
-    #[arg(long = "map-threads", help_heading = "Performance", verbatim_doc_comment)]
+    #[arg(
+        long = "map-threads",
+        help_heading = "Performance",
+        verbatim_doc_comment
+    )]
     pub map_threads: Option<usize>,
-    
+
     // --- Error Handling ---
     /// Print error location (File, Offset, Capture Group) to stderr as it happens.
     #[arg(short = 'e', long = "show-errors", help_heading = "Error Handling")]
@@ -81,13 +103,16 @@ pub struct Cli {
     /// Enable manual internal profiling (Regex vs Parse vs Map time)
     #[arg(long = "profile", help_heading = "Performance")]
     pub profile: bool,
-    
-    /// Comma separated list of operations to disable for benchmarking:
-    /// 'regex' (disable regex parsing), 'maptarget' (disable value parsing), 
-    /// 'mapwrite' (disable map insertion).
-    #[arg(long = "disable-operations", help_heading = "Performance", verbatim_doc_comment)]
-    pub disable_operations: Option<String>,
 
+    /// Comma separated list of operations to disable for benchmarking:
+    /// 'regex' (disable regex parsing), 'maptarget' (disable value parsing),
+    /// 'mapwrite' (disable map insertion).
+    #[arg(
+        long = "disable-operations",
+        help_heading = "Performance",
+        verbatim_doc_comment
+    )]
+    pub disable_operations: Option<String>,
 
     // --- Database Options ---
     /// Database output file. Defaults to scan_HHMMSS.db
@@ -103,9 +128,12 @@ pub struct Cli {
     pub batch_size: usize,
 
     /// SQLite Cache Size in MB
-    #[arg(long = "cache-mb", default_value_t = 100, help_heading = "Database Options")]
+    #[arg(
+        long = "cache-mb",
+        default_value_t = 100,
+        help_heading = "Database Options"
+    )]
     pub cache_mb: i64,
-
 
     // --- SQL Hooks ---
     /// Execute SQL string BEFORE scanning starts
@@ -123,7 +151,6 @@ pub struct Cli {
     /// Execute SQL script from file AFTER scanning finishes
     #[arg(long = "post-sql-file", help_heading = "SQL Hooks")]
     pub post_sql_file: Option<PathBuf>,
-
 
     // --- Performance/System ---
     /// Stats ticker interval in milliseconds

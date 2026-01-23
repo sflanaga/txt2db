@@ -419,6 +419,13 @@ fn main() -> Result<()> {
                 files, skipped, files_rate, mb_total, mb_rate, matches, total_recs, recs_rate, parse_errors, cpu_stats);
 
     println!("Timing: [Wall Time: {:.3}s] [CPU Time: {:.3}s]", duration, cpu_seconds);
+    // Post-run warnings for empty results
+    if files == 0 {
+        println!("Warning: No files matched filters/path-regex; nothing was processed.");
+    }
+    if total_recs == 0 {
+        println!("Warning: No lines matched the regex; no output produced.");
+    }
 
     if parse_errors > 0 {
         println!("\n--- Parse Errors by Field Index ---");
