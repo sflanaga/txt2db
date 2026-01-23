@@ -5,6 +5,8 @@ use std::io::Write;
 use tempfile::TempDir;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use predicates::str::contains;
+use predicates::prelude::PredicateBooleanExt;
 
 // --- Helper Functions ---
 
@@ -501,5 +503,248 @@ fn test_stop_on_error() -> anyhow::Result<()> {
        .assert()
        .failure(); // Should fail with exit code 1
 
+    Ok(())
+}
+
+// --- New tests for broader CLI coverage ---
+
+#[test]
+fn test_map_mode_path_regex_positive() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let file_path = temp.path().join("2026-01-23.log");
+    let mut f = File::create(&file_path)?;
+    writeln!(f, "flush=10 close=20 rename=30")?;
+    writeln!(f, "flush=5 close=10 rename=15")?;
+
+    let mut cmd = txt2db_cmd();
+    let assert = cmd
+        .arg(file_path.to_str().unwrap())
+        .arg("--path-regex")
+        .arg(r"\d{4}-\d{2}-(\d{2})\.log")
+        .arg("--regex")
+        .arg(r"flush=(\d+) close=(\d+) rename=(\d+)")
+        .arg("-m")
+        .arg("p1_k_s;1_s_i;2_s_i;3_s_i")
+        .assert()
+        .success();
+
+    let out_str = std::str::from_utf8(&assert.get_output().stdout)?;
+    // Expect day "23" as key, sums 15/30/45
+    assert!(out_str.contains("23\t15\t30\t45"));
+    Ok(())
+}
+
+#[test]
+fn test_map_mode_path_regex_no_match_skips() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let file_path = temp.path().join("nomatch.log");
+    let mut f = File::create(&file_path)?;
+    writeln!(f, "flush=1 close=2 rename=3")?;
+
+    let mut cmd = txt2db_cmd();
+    let assert = cmd
+        .arg(file_path.to_str().unwrap())
+        .arg("--path-regex")
+        .arg(r"\d{4}-\d{2}-(\d{2})\.log")
+        .arg("--regex")
+        .arg(r"flush=(\d+) close=(\d+) rename=(\d+)")
+        .arg("-m")
+        .arg("p1_k_s;1_s_i;2_s_i;3_s_i")
+        .assert()
+        .success();
+
+    let out_str = std::str::from_utf8(&assert.get_output().stdout)?;
+    // No match on path => no aggregation rows
+    assert!(!out_str.contains('\t') || out_str.lines().all(|l| !l.contains('\t') || l.starts_with("Key_")));
+    Ok(())
+}
+
+#[test]
+fn test_map_mode_mixed_line_and_path_captures() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let file_path = temp.path().join("server-42.log");
+    let mut f = File::create(&file_path)?;
+    writeln!(f, "user=jane count=3")?;
+    writeln!(f, "user=jane count=2")?;
+    writeln!(f, "user=bob count=5")?;
+
+    let mut cmd = txt2db_cmd();
+    let assert = cmd
+        .arg(file_path.to_str().unwrap())
+        .arg("--path-regex")
+        .arg(r"server-(\d+)")
+        .arg("--regex")
+        .arg(r"user=(\w+) count=(\d+)")
+        .arg("-m")
+        .arg("p1_k_i;1_k_s;2_s_i") // path group 1, line group 1, sum of group 2
+        .assert()
+        .success();
+
+    let out_str = std::str::from_utf8(&assert.get_output().stdout)?;
+    // Expect keys (42, jane) sum=5 and (42, bob) sum=5
+    assert!(out_str.contains("42\tjane\t5"));
+    assert!(out_str.contains("42\tbob\t5"));
+    Ok(())
+}
+
+#[test]
+fn test_map_mode_average() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let file_path = temp.path().join("avg.log");
+    let mut f = File::create(&file_path)?;
+    writeln!(f, "A 2")?;
+    writeln!(f, "A 4")?;
+    writeln!(f, "A 6")?;
+
+    let mut cmd = txt2db_cmd();
+    let assert = cmd
+        .arg(file_path.to_str().unwrap())
+        .arg("--regex")
+        .arg(r"(\w+) (\d+)")
+        .arg("-m")
+        .arg("1_k_s;2_a_i")
+        .assert()
+        .success();
+
+    let out_str = std::str::from_utf8(&assert.get_output().stdout)?;
+    // Average should be (2+4+6)/3 = 4
+    assert!(out_str.contains("A\t4"));
+    Ok(())
+}
+
+#[test]
+fn test_invalid_map_definition_error_message() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let file_path = temp.path().join("badmap.log");
+    let mut f = File::create(&file_path)?;
+    writeln!(f, "x 1")?;
+
+    let mut cmd = txt2db_cmd();
+    cmd.arg(file_path.to_str().unwrap())
+        .arg("--regex")
+        .arg(r"(\w+) (\d+)")
+        .arg("-m")
+        .arg("1_z_i") // invalid role
+        .assert()
+        .failure()
+        .stderr(contains("Invalid map definition (--map)").and(contains("1_z_i")));
+    Ok(())
+}
+
+#[test]
+fn test_invalid_regex_error_message() -> anyhow::Result<()> {
+    let mut cmd = txt2db_cmd();
+    cmd.arg("--regex")
+        .arg("(") // invalid regex
+        .arg("--db-path")
+        .arg("/tmp/nowhere.db") // dummy to satisfy args
+        .arg("--data-stdin")
+        .write_stdin("")
+        .assert()
+        .failure()
+        .stderr(contains("Invalid Line Regex (--regex)"));
+    Ok(())
+}
+
+#[test]
+fn test_disable_mapwrite_produces_no_rows() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let file_path = temp.path().join("disable.log");
+    let mut f = File::create(&file_path)?;
+    writeln!(f, "A 1")?;
+    writeln!(f, "A 2")?;
+
+    let mut cmd = txt2db_cmd();
+    let assert = cmd
+        .arg(file_path.to_str().unwrap())
+        .arg("--regex")
+        .arg(r"(\w+) (\d+)")
+        .arg("-m")
+        .arg("1_k_s;2_s_i")
+        .arg("--disable-operations")
+        .arg("mapwrite")
+        .assert()
+        .success();
+
+    let out_str = std::str::from_utf8(&assert.get_output().stdout)?;
+    // mapwrite disabled => no aggregation rows
+    assert!(!out_str.contains('\t') || out_str.lines().all(|l| !l.contains('\t') || l.starts_with("Key_")));
+    Ok(())
+}
+
+#[test]
+fn test_map_mode_path_capture_parse_error_counts() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let file_path = temp.path().join("server-xx.log"); // xx not numeric, will fail p1_s_i parse
+    let mut f = File::create(&file_path)?;
+    writeln!(f, "val=10")?;
+
+    let mut cmd = txt2db_cmd();
+    let assert = cmd
+        .arg(file_path.to_str().unwrap())
+        .arg("--path-regex")
+        .arg(r"server-(\w+)") // match "xx" so parse to i64 fails
+        .arg("--regex")
+        .arg(r"val=(\d+)")
+        .arg("-m")
+        .arg("p1_k_i;1_s_i")
+        .assert()
+        .success();
+
+    let out_str = std::str::from_utf8(&assert.get_output().stdout)?;
+    // Should report one parse error for capture group 1 (path capture)
+    assert!(out_str.contains("Parse Errors: 1"));
+    assert!(out_str.contains("Capture Group 1: 1 errors"));
+    Ok(())
+}
+
+#[test]
+fn test_map_mode_files_from_stdin_with_path_regex() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let file_path = temp.path().join("2026-02-05.log");
+    let mut f = File::create(&file_path)?;
+    writeln!(f, "x=1")?;
+    let list = format!("{}\n", file_path.to_str().unwrap());
+
+    let mut cmd = txt2db_cmd();
+    let assert = cmd
+        .arg("--files-from-stdin")
+        .arg("--path-regex")
+        .arg(r"\d{4}-\d{2}-(\d{2})\.log")
+        .arg("--regex")
+        .arg(r"x=(\d+)")
+        .arg("-m")
+        .arg("p1_k_s;1_s_i")
+        .write_stdin(list)
+        .assert()
+        .success();
+
+    let out_str = std::str::from_utf8(&assert.get_output().stdout)?;
+    assert!(out_str.contains("05\t1"));
+    Ok(())
+}
+
+#[test]
+fn test_map_mode_pcre_line_regex_with_path_regex() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let file_path = temp.path().join("pcreserver-77.log");
+    let mut f = File::create(&file_path)?;
+    writeln!(f, "VAL=123")?;
+
+    let mut cmd = txt2db_cmd();
+    let assert = cmd
+        .arg(file_path.to_str().unwrap())
+        .arg("--pcre2")
+        .arg("--path-regex")
+        .arg(r"pcreserver-(\d+)")
+        .arg("--regex")
+        .arg(r"VAL=(\d+)")
+        .arg("-m")
+        .arg("p1_k_i;1_s_i")
+        .assert()
+        .success();
+
+    let out_str = std::str::from_utf8(&assert.get_output().stdout)?;
+    assert!(out_str.contains("77\t123"));
     Ok(())
 }
