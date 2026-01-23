@@ -748,3 +748,47 @@ fn test_map_mode_pcre_line_regex_with_path_regex() -> anyhow::Result<()> {
     assert!(out_str.contains("77\t123"));
     Ok(())
 }
+
+#[test]
+fn test_filter_and_path_regex_together() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let db_path = temp.path().join("filter_path.db");
+
+    // Will match filter (.log) and path regex (host-01)
+    let good = temp.path().join("host-01").join("app.log");
+    fs::create_dir_all(good.parent().unwrap())?;
+    File::create(&good)?.write_all(b"OK 1")?;
+
+    // Fails filter (.txt) even though host matches path regex
+    let wrong_ext = temp.path().join("host-01").join("app.txt");
+    File::create(&wrong_ext)?.write_all(b"OK 2")?;
+
+    // Matches filter (.log) but fails path regex (host name wrong)
+    let wrong_host = temp.path().join("node-02").join("app.log");
+    fs::create_dir_all(wrong_host.parent().unwrap())?;
+    File::create(&wrong_host)?.write_all(b"OK 3")?;
+
+    let mut cmd = txt2db_cmd();
+    cmd.arg(temp.path())
+        .arg("--filter").arg(r".*\.log$")            // keep only .log
+        .arg("--path-regex").arg(r"host-(\d+)")      // extract host id and exclude non-matching hosts
+        .arg("--regex").arg(r"(OK) (\d+)")
+        .arg("--fields").arg("p1:host;l1:status;l2:val")
+        .arg("--db-path").arg(db_path.to_str().unwrap())
+        .assert()
+        .success();
+
+    // Only one file should be processed (good)
+    assert_eq!(count_rows(db_path.to_str().unwrap(), "data"), 1);
+
+    let conn = Connection::open(&db_path)?;
+    let row: (String, String, String) = conn.query_row(
+        "SELECT host, status, val FROM data",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    assert_eq!(row, ("01".to_string(), "OK".to_string(), "1".to_string()));
+
+    Ok(())
+}
+

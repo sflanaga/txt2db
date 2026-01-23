@@ -340,7 +340,18 @@ fn main() -> Result<()> {
             path_iterators.push(Box::new(iter));
         }
 
-        let unified_iter = path_iterators.into_iter().flatten();
+        // Pre-filter by --path-regex to avoid counting non-matching files in file/byte stats.
+        let filter_path_re = path_re.clone();
+        let unified_iter = path_iterators
+            .into_iter()
+            .flatten()
+            .filter(move |p| {
+                if let Some(ref re) = filter_path_re {
+                    re.is_match(&p.to_string_lossy())
+                } else {
+                    true
+                }
+            });
         splicer.run(unified_iter)?;
     }
 
