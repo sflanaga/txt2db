@@ -12,9 +12,9 @@ fn main() {
         .and_then(|o| if o.status.success() { String::from_utf8(o.stdout).ok() } else { None })
         .map(|s| s.trim().to_string());
 
-    // git status --porcelain (dirty if any output)
+    // git status --porcelain --untracked-files=no (dirty if tracked files are changed)
     let dirty = Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--untracked-files=no"])
         .output()
         .ok()
         .map(|o| !o.stdout.is_empty())
