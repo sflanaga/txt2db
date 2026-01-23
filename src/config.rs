@@ -2,7 +2,7 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(author, version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_INFO"), ")"), about)]
+#[command(author, version, about)]
 // term_width = 0 means "Auto-detect terminal width".
 #[command(term_width = 0)] 
 pub struct Cli {
@@ -56,7 +56,7 @@ pub struct Cli {
     #[arg(short = 'F', long = "fields", help_heading = "Parsing Options", verbatim_doc_comment)]
     pub field_map: Option<String>,
     
-    /// Aggregation map definition (e.g. "1_k_i;2_k_s;5_s_i").
+    /// Aggregation map definition (e.g. "1_k_i;2_k_s;5_s_i"; supports path captures like "p1_k_s").
     /// Mutually exclusive with Database mode.
     /// Format: index_role_type separated by ;. 
     /// Roles: k=Key, s=Sum, c=Count, x=Max, n=Min, a=Avg.

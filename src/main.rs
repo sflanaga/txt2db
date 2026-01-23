@@ -59,25 +59,25 @@ fn main() -> Result<()> {
         let re = pcre2::bytes::RegexBuilder::new()
             .jit_if_available(true)
             .build(&cli.regex)
-            .map_err(|e| anyhow::anyhow!("Invalid PCRE2 Regex: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Invalid PCRE2 Regex (--regex): {}", e))?;
         AnyRegex::Pcre(re)
     } else {
         let re = regex::RegexBuilder::new(&cli.regex)
             .multi_line(true)
             .build()
-            .context("Invalid Line Regex")?;
+            .context("Invalid Line Regex (--regex)")?;
         AnyRegex::Std(re)
     };
 
     let path_re = if let Some(pr) = &cli.path_regex {
-        Some(Regex::new(pr).context("Invalid Path Regex")?)
+        Some(Regex::new(pr).context("Invalid Path Regex (--path-regex)")?)
     } else {
         None
     };
 
     // Setup Map Specs
     let map_specs = if let Some(def) = &cli.map_def {
-        Some(parse_map_def(def)?)
+        Some(parse_map_def(def).context(format!("Invalid map definition (--map): '{}'", def))?)
     } else {
         None
     };
@@ -88,16 +88,16 @@ fn main() -> Result<()> {
         for part in map_str.split(';') {
             let kv: Vec<&str> = part.split(':').collect();
             if kv.len() == 2 {
-                let key = kv[0]; 
+                let key = kv[0].trim(); 
                 let name = kv[1].to_string();
                 if let Some(idx_str) = key.strip_prefix('p') {
-                    let idx: usize = idx_str.parse().context("Invalid path index")?;
+                    let idx: usize = idx_str.trim().parse().map_err(|e| anyhow::anyhow!("Invalid path index '{}' in --fields part '{}': {}", idx_str, part, e))?;
                     columns.push(ColumnDef { name, source: FieldSource::Path(idx) });
                 } else if let Some(idx_str) = key.strip_prefix('l') {
-                    let idx: usize = idx_str.parse().context("Invalid line index")?;
+                    let idx: usize = idx_str.trim().parse().map_err(|e| anyhow::anyhow!("Invalid line index '{}' in --fields part '{}': {}", idx_str, part, e))?;
                     columns.push(ColumnDef { name, source: FieldSource::Line(idx) });
                 } else {
-                    let idx: usize = key.parse().context("Invalid index")?;
+                    let idx: usize = key.trim().parse().map_err(|e| anyhow::anyhow!("Invalid index '{}' in --fields part '{}': {}", key, part, e))?;
                     columns.push(ColumnDef { name, source: FieldSource::Line(idx) });
                 }
             }
@@ -129,7 +129,7 @@ fn main() -> Result<()> {
     let splicer_count = cli.splicer_threads.unwrap_or_else(|| std::cmp::max(1, total_cores / 2));
     
     let path_filter = if let Some(pattern) = cli.filter_pattern {
-        Some(Regex::new(&pattern).context("Invalid filter regex")?)
+        Some(Regex::new(&pattern).context("Invalid filter regex (--filter)")?)
     } else {
         None
     };
@@ -229,9 +229,10 @@ fn main() -> Result<()> {
             let stats = db_stats.clone();
             let l_re = line_re.clone();
             let t_flags = flags.clone();
+            let thread_path_re = path_re.clone();
             
             map_handles.push(thread::spawn(move || {
-                run_mapper_worker(rx, r_tx, specs, l_re, stats, show_errors, stop_on_error, enable_profiling, t_flags)
+                run_mapper_worker(rx, r_tx, specs, l_re, thread_path_re, stats, show_errors, stop_on_error, enable_profiling, t_flags)
             }));
         }
 

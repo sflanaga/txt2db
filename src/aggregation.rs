@@ -7,11 +7,15 @@ pub enum AggRole { Key, Sum, Count, Max, Min, Avg }
 #[derive(Clone, Debug, PartialEq, Copy)]
 pub enum AggType { I64, U64, F64, Str }
 
+#[derive(Clone, Debug, PartialEq, Copy)]
+pub enum FieldSource { Line, Path }
+
 #[derive(Clone, Debug)]
 pub struct MapFieldSpec {
     pub capture_index: usize,
     pub role: AggRole,
     pub dtype: AggType,
+    pub source: FieldSource,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
@@ -169,9 +173,27 @@ impl AggAccumulator {
 pub fn parse_map_def(def: &str) -> Result<Vec<MapFieldSpec>> {
     let mut specs = Vec::new();
     for part in def.split(';') {
-        let tokens: Vec<&str> = part.split('_').collect();
-        if tokens.len() != 3 { anyhow::bail!("Invalid map spec: {}", part); }
-        let idx: usize = tokens[0].parse()?;
+        let part = part.trim();
+        let tokens: Vec<&str> = part.split('_').map(|t| t.trim()).collect();
+        if tokens.len() != 3 { anyhow::bail!("Invalid map spec '{}': expected 3 tokens (index_role_type)", part); }
+
+        let mut source = FieldSource::Line;
+        let mut idx_str = tokens[0];
+        if let Some(rest) = idx_str.strip_prefix('p') {
+            source = FieldSource::Path;
+            idx_str = rest;
+        } else if let Some(rest) = idx_str.strip_prefix('P') {
+            source = FieldSource::Path;
+            idx_str = rest;
+        } else if let Some(rest) = idx_str.strip_prefix('l') {
+            source = FieldSource::Line;
+            idx_str = rest;
+        } else if let Some(rest) = idx_str.strip_prefix('L') {
+            source = FieldSource::Line;
+            idx_str = rest;
+        }
+        let idx: usize = idx_str.trim().parse().map_err(|e| anyhow::anyhow!("Invalid capture index '{}' in map spec '{}': {}", idx_str, part, e))?;
+
         let role = match tokens[1] {
             "k" => AggRole::Key,
             "s" => AggRole::Sum,
@@ -179,16 +201,16 @@ pub fn parse_map_def(def: &str) -> Result<Vec<MapFieldSpec>> {
             "x" => AggRole::Max,
             "n" => AggRole::Min,
             "a" => AggRole::Avg,
-            _ => anyhow::bail!("Unknown role: {}", tokens[1]),
+            other => anyhow::bail!("Unknown role '{}' in map spec '{}'", other, part),
         };
         let dtype = match tokens[2] {
             "i" => AggType::I64,
             "u" => AggType::U64,
             "f" => AggType::F64,
             "s" => AggType::Str,
-            _ => anyhow::bail!("Unknown type: {}", tokens[2]),
+            other => anyhow::bail!("Unknown type '{}' in map spec '{}'", other, part),
         };
-        specs.push(MapFieldSpec { capture_index: idx, role, dtype });
+        specs.push(MapFieldSpec { capture_index: idx, role, dtype, source });
     }
     Ok(specs)
 }
@@ -205,8 +227,20 @@ pub fn print_map_results(map: BTreeMap<Vec<AggValue>, Vec<AggAccumulator>>, spec
 
     // Header
     let mut headers = Vec::new();
-    for &i in &key_indices { headers.push(format!("Key_{}", specs[i].capture_index)); }
-    for &i in &val_indices { headers.push(format!("{:?}_{}", specs[i].role, specs[i].capture_index)); }
+    for &i in &key_indices { 
+        let prefix = match specs[i].source {
+            FieldSource::Line => format!("Key_{}", specs[i].capture_index),
+            FieldSource::Path => format!("Key_p{}", specs[i].capture_index),
+        };
+        headers.push(prefix);
+    }
+    for &i in &val_indices { 
+        let prefix = match specs[i].source {
+            FieldSource::Line => format!("{:?}_{}", specs[i].role, specs[i].capture_index),
+            FieldSource::Path => format!("{:?}_p{}", specs[i].role, specs[i].capture_index),
+        };
+        headers.push(prefix);
+    }
     println!("{}", headers.join("\t"));
 
     for (key, values) in map {

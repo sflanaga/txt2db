@@ -1,13 +1,13 @@
 use crossbeam_channel::{Receiver, Sender};
 use regex::Regex;
 use pcre2::bytes::Regex as PcreRegex;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use crate::aggregation::{AggAccumulator, AggRole, AggValue, MapFieldSpec};
+use crate::aggregation::{AggAccumulator, AggRole, AggValue, FieldSource, MapFieldSpec};
 use crate::config::DisableConfig;
-use crate::database::{ColumnDef, DbRecord, FieldSource};
+use crate::database::{ColumnDef, DbRecord, FieldSource as DbFieldSource};
 use crate::io_splicer::SplicedChunk;
 use crate::stats::DbStats;
 
@@ -37,7 +37,7 @@ fn read_cycle_counter() -> u64 {
 
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 fn read_cycle_counter() -> u64 {
-    // Fallback for non-x86 (e.g. ARM/M1) - roughly nanoseconds
+    // Fallback for non-x86 (e.g., ARM/M1) - roughly nanoseconds
     std::time::Instant::now().elapsed().as_nanos() as u64
 }
 
@@ -46,6 +46,7 @@ pub fn run_mapper_worker(
     recycle_tx: Sender<Vec<u8>>,
     specs: Vec<MapFieldSpec>,
     line_re: AnyRegex,
+    path_re: Option<Regex>,
     stats: Arc<DbStats>,
     show_errors: bool,
     stop_on_error: bool,
@@ -53,9 +54,30 @@ pub fn run_mapper_worker(
     disable_flags: Arc<DisableConfig>,
 ) -> BTreeMap<Vec<AggValue>, Vec<AggAccumulator>> {
     match line_re {
-        AnyRegex::Std(re) => run_mapper_worker_std(rx, recycle_tx, specs, re, stats, show_errors, stop_on_error, enable_profiling, disable_flags),
-        AnyRegex::Pcre(re) => run_mapper_worker_pcre(rx, recycle_tx, specs, re, stats, show_errors, stop_on_error, enable_profiling, disable_flags),
+        AnyRegex::Std(re) => run_mapper_worker_std(rx, recycle_tx, specs, re, path_re, stats, show_errors, stop_on_error, enable_profiling, disable_flags),
+        AnyRegex::Pcre(re) => run_mapper_worker_pcre(rx, recycle_tx, specs, re, path_re, stats, show_errors, stop_on_error, enable_profiling, disable_flags),
     }
+}
+
+fn fetch_path_caps<'a>(
+    path_cache: &'a mut HashMap<Arc<std::path::PathBuf>, Option<Vec<Option<String>>>>,
+    path_re: &Regex,
+    path_arc: &Arc<std::path::PathBuf>,
+) -> Option<&'a Option<Vec<Option<String>>>> {
+    if !path_cache.contains_key(path_arc) {
+        let p_str = path_arc.to_string_lossy();
+        let entry = if let Some(caps) = path_re.captures(&p_str) {
+            let mut v = Vec::with_capacity(path_re.captures_len());
+            for i in 0..path_re.captures_len() {
+                v.push(caps.get(i).map(|m| m.as_str().to_string()));
+            }
+            Some(v)
+        } else {
+            None
+        };
+        path_cache.insert(path_arc.clone(), entry);
+    }
+    path_cache.get(path_arc)
 }
 
 fn run_mapper_worker_std(
@@ -63,6 +85,7 @@ fn run_mapper_worker_std(
     recycle_tx: Sender<Vec<u8>>,
     specs: Vec<MapFieldSpec>,
     line_re: Regex,
+    path_re: Option<Regex>,
     stats: Arc<DbStats>,
     show_errors: bool,
     stop_on_error: bool,
@@ -71,6 +94,7 @@ fn run_mapper_worker_std(
 ) -> BTreeMap<Vec<AggValue>, Vec<AggAccumulator>> {
     
     let mut map: BTreeMap<Vec<AggValue>, Vec<AggAccumulator>> = BTreeMap::new();
+    let mut path_cache: HashMap<Arc<std::path::PathBuf>, Option<Vec<Option<String>>>> = HashMap::new();
     
     // Performance counters (Cycles)
     let mut c_regex: u64 = 0;
@@ -94,6 +118,25 @@ fn run_mapper_worker_std(
              let _ = recycle_tx.send(data);
              continue;
         }
+
+        // Path captures (once per file path, cached)
+        let path_caps = if let (Some(pr), Some(ref path_arc)) = (&path_re, chunk.file_path.as_ref()) {
+            match fetch_path_caps(&mut path_cache, pr, path_arc) {
+                Some(Some(v)) => Some(v),
+                Some(None) => {
+                    data.clear();
+                    let _ = recycle_tx.send(data);
+                    continue;
+                },
+                None => {
+                    data.clear();
+                    let _ = recycle_tx.send(data);
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
 
         let path_display = chunk.file_path.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "stdin".to_string());
         let chunk_offset = chunk.offset;
@@ -134,7 +177,12 @@ fn run_mapper_worker_std(
                 let abs_offset = chunk_offset + match_start as u64;
 
                 for spec in &specs {
-                    let raw = capture.get(spec.capture_index).map(|m| m.as_str()).unwrap_or("");
+                    let raw = match spec.source {
+                        FieldSource::Line => capture.get(spec.capture_index).map(|m| m.as_str()).unwrap_or(""),
+                        FieldSource::Path => path_caps
+                            .and_then(|caps| caps.get(spec.capture_index).and_then(|o| o.as_deref()))
+                            .unwrap_or(""),
+                    };
                     match AggValue::from_str(raw, spec.dtype) {
                         Some(val) => agg_row.push(val),
                         None => {
@@ -207,7 +255,12 @@ fn run_mapper_worker_std(
                 let abs_offset = chunk_offset + match_start as u64;
 
                 for spec in &specs {
-                    let raw = capture.get(spec.capture_index).map(|m| m.as_str()).unwrap_or("");
+                    let raw = match spec.source {
+                        FieldSource::Line => capture.get(spec.capture_index).map(|m| m.as_str()).unwrap_or(""),
+                        FieldSource::Path => path_caps
+                            .and_then(|caps| caps.get(spec.capture_index).and_then(|o| o.as_deref()))
+                            .unwrap_or(""),
+                    };
                     match AggValue::from_str(raw, spec.dtype) {
                         Some(val) => agg_row.push(val),
                         None => {
@@ -276,6 +329,7 @@ fn run_mapper_worker_pcre(
     recycle_tx: Sender<Vec<u8>>,
     specs: Vec<MapFieldSpec>,
     line_re: PcreRegex,
+    path_re: Option<Regex>,
     stats: Arc<DbStats>,
     show_errors: bool,
     stop_on_error: bool,
@@ -284,6 +338,7 @@ fn run_mapper_worker_pcre(
 ) -> BTreeMap<Vec<AggValue>, Vec<AggAccumulator>> {
     
     let mut map: BTreeMap<Vec<AggValue>, Vec<AggAccumulator>> = BTreeMap::new();
+    let mut path_cache: HashMap<Arc<std::path::PathBuf>, Option<Vec<Option<String>>>> = HashMap::new();
     
     // Performance counters (Cycles)
     let mut c_regex: u64 = 0;
@@ -306,6 +361,24 @@ fn run_mapper_worker_pcre(
              let _ = recycle_tx.send(data);
              continue;
         }
+
+        let path_caps = if let (Some(pr), Some(ref path_arc)) = (&path_re, chunk.file_path.as_ref()) {
+            match fetch_path_caps(&mut path_cache, pr, path_arc) {
+                Some(Some(v)) => Some(v),
+                Some(None) => {
+                    data.clear();
+                    let _ = recycle_tx.send(data);
+                    continue;
+                },
+                None => {
+                    data.clear();
+                    let _ = recycle_tx.send(data);
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
 
         let path_display = chunk.file_path.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "stdin".to_string());
         let chunk_offset = chunk.offset;
@@ -336,9 +409,19 @@ fn run_mapper_worker_pcre(
                     for spec in &specs {
                         // Extract bytes and convert to string for parsing
                         // This is potentially lossy, matching the behavior of from_utf8_lossy in std mode
-                        let raw_bytes = capture.get(spec.capture_index).map(|m| m.as_bytes()).unwrap_or(&[]);
-                        let raw = String::from_utf8_lossy(raw_bytes);
-                        
+                        let raw = match spec.source {
+                            FieldSource::Line => {
+                                let raw_bytes = capture.get(spec.capture_index).map(|m| m.as_bytes()).unwrap_or(&[]);
+                                String::from_utf8_lossy(raw_bytes)
+                            },
+                            FieldSource::Path => {
+                                path_caps
+                                    .and_then(|caps| caps.get(spec.capture_index).and_then(|o| o.as_deref()))
+                                    .map(|s| std::borrow::Cow::Borrowed(s))
+                                    .unwrap_or_else(|| std::borrow::Cow::Borrowed(""))
+                            }
+                        };
+
                         match AggValue::from_str(&raw, spec.dtype) {
                             Some(val) => agg_row.push(val),
                             None => {
@@ -412,8 +495,18 @@ fn run_mapper_worker_pcre(
                     let abs_offset = chunk_offset + match_start as u64;
 
                     for spec in &specs {
-                        let raw_bytes = capture.get(spec.capture_index).map(|m| m.as_bytes()).unwrap_or(&[]);
-                        let raw = String::from_utf8_lossy(raw_bytes);
+                        let raw = match spec.source {
+                            FieldSource::Line => {
+                                let raw_bytes = capture.get(spec.capture_index).map(|m| m.as_bytes()).unwrap_or(&[]);
+                                String::from_utf8_lossy(raw_bytes)
+                            },
+                            FieldSource::Path => {
+                                path_caps
+                                    .and_then(|caps| caps.get(spec.capture_index).and_then(|o| o.as_deref()))
+                                    .map(|s| std::borrow::Cow::Borrowed(s))
+                                    .unwrap_or_else(|| std::borrow::Cow::Borrowed(""))
+                            }
+                        };
 
                         match AggValue::from_str(&raw, spec.dtype) {
                             Some(val) => agg_row.push(val),
@@ -516,7 +609,7 @@ fn run_db_parser_std(
                 let p_str = p.to_string_lossy();
                 if let Some(caps) = pre.captures(&p_str) {
                         for col in &columns {
-                            if let FieldSource::Path(idx) = col.source {
+                            if let DbFieldSource::Path(idx) = col.source {
                                 let val = caps.get(idx).map(|m| m.as_str().to_string()).unwrap_or_default();
                                 path_fields.push((idx, val));
                             }
@@ -558,10 +651,10 @@ fn run_db_parser_std(
                 let mut fields = Vec::with_capacity(columns.len());
                 for col in &columns {
                     match col.source {
-                        FieldSource::Line(idx) => {
+                        DbFieldSource::Line(idx) => {
                             fields.push(capture.get(idx).map(|m| m.as_str().to_string()));
                         },
-                        FieldSource::Path(idx) => {
+                        DbFieldSource::Path(idx) => {
                             let val = path_fields.iter().find(|(k, _)| *k == idx).map(|(_, v)| v.clone());
                             fields.push(val);
                         }
@@ -605,7 +698,7 @@ fn run_db_parser_pcre(
                 let p_str = p.to_string_lossy();
                 if let Some(caps) = pre.captures(&p_str) {
                         for col in &columns {
-                            if let FieldSource::Path(idx) = col.source {
+                            if let DbFieldSource::Path(idx) = col.source {
                                 let val = caps.get(idx).map(|m| m.as_str().to_string()).unwrap_or_default();
                                 path_fields.push((idx, val));
                             }
@@ -647,11 +740,11 @@ fn run_db_parser_pcre(
                     let mut fields = Vec::with_capacity(columns.len());
                     for col in &columns {
                         match col.source {
-                            FieldSource::Line(idx) => {
+                            DbFieldSource::Line(idx) => {
                                 let val = capture.get(idx).map(|m| String::from_utf8_lossy(m.as_bytes()).to_string());
                                 fields.push(val);
                             },
-                            FieldSource::Path(idx) => {
+                            DbFieldSource::Path(idx) => {
                                 let val = path_fields.iter().find(|(k, _)| *k == idx).map(|(_, v)| v.clone());
                                 fields.push(val);
                             }
