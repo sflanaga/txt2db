@@ -2,7 +2,7 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about)]
+#[command(author, version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_INFO"), ")"), about)]
 // term_width = 0 means "Auto-detect terminal width".
 #[command(term_width = 0)] 
 pub struct Cli {
