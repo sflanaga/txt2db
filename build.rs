@@ -1,6 +1,15 @@
 use std::process::Command;
 
 fn main() {
+    // Re-run when git state changes (HEAD move, index changes, ref updates),
+    // or when caller toggles FORCE_BUILD_RS.
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/index");
+    println!("cargo:rerun-if-changed=.git/refs");
+    println!("cargo:rerun-if-changed=.git/packed-refs");
+    println!("cargo:rerun-if-env-changed=FORCE_BUILD_RS");
+
     // Fallbacks in case git is missing (e.g., from a source tarball)
     let mut git_info = "unknown".to_string();
 

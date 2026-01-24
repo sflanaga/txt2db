@@ -427,6 +427,7 @@ fn main() -> Result<()> {
         println!("Warning: No lines matched the regex; no output produced.");
     }
 
+
     if parse_errors > 0 {
         println!("\n--- Parse Errors by Field Index ---");
         // FIXED: Explicit type annotation for DashMap iterator
