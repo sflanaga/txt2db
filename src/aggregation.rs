@@ -1,5 +1,8 @@
 use anyhow::Result;
 use std::collections::BTreeMap;
+use std::io::Write;
+
+use crate::output::{fmt_float, make_sink, OutputConfig};
 
 #[derive(Clone, Debug, PartialEq, Copy)]
 pub enum AggRole {
@@ -31,6 +34,7 @@ pub struct MapFieldSpec {
     pub role: AggRole,
     pub dtype: AggType,
     pub source: FieldSource,
+    pub name: Option<String>, // Optional custom header from --map (e.g., p1_k_s:source)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
@@ -65,8 +69,22 @@ impl AggValue {
         }
         match t {
             AggType::Str => Some(AggValue::Str(s.to_string())),
-            AggType::I64 => s.parse().ok().map(AggValue::I64),
-            AggType::U64 => s.parse().ok().map(AggValue::U64),
+            AggType::I64 => {
+                if let Ok(v) = s.parse::<i128>() {
+                    let clamped = v.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+                    Some(AggValue::I64(clamped))
+                } else {
+                    None
+                }
+            }
+            AggType::U64 => {
+                if let Ok(v) = s.parse::<u128>() {
+                    let clamped = v.min(u64::MAX as u128) as u64;
+                    Some(AggValue::U64(clamped))
+                } else {
+                    None
+                }
+            }
             AggType::F64 => s.parse().ok().map(|f| AggValue::F64(OrderedFloat(f))),
         }
     }
@@ -196,7 +214,6 @@ impl AggAccumulator {
         }
     }
 
-    // Merge two accumulators from different threads
     pub fn merge(&mut self, other: AggAccumulator) {
         match (self, other) {
             (AggAccumulator::SumI(a), AggAccumulator::SumI(b)) => *a += b,
@@ -252,7 +269,16 @@ pub fn parse_map_def(def: &str) -> Result<Vec<MapFieldSpec>> {
     let mut specs = Vec::new();
     for part in def.split(';') {
         let part = part.trim();
-        let tokens: Vec<&str> = part.split('_').map(|t| t.trim()).collect();
+        if part.is_empty() {
+            continue;
+        }
+
+        // Split optional label: "<spec>:<label>"
+        let mut spec_label = part.splitn(2, ':');
+        let spec_part = spec_label.next().unwrap_or("");
+        let label_part = spec_label.next().map(|s| s.trim()).filter(|s| !s.is_empty());
+
+        let tokens: Vec<&str> = spec_part.split('_').map(|t| t.trim()).collect();
         if tokens.len() != 3 {
             anyhow::bail!(
                 "Invalid map spec '{}': expected 3 tokens (index_role_type)",
@@ -305,17 +331,18 @@ pub fn parse_map_def(def: &str) -> Result<Vec<MapFieldSpec>> {
             role,
             dtype,
             source,
+            name: label_part.map(|s| s.to_string()),
         });
     }
     Ok(specs)
 }
 
-pub fn print_map_results(
+pub fn render_map_results(
     map: BTreeMap<Vec<AggValue>, Vec<AggAccumulator>>,
     specs: Vec<MapFieldSpec>,
-) {
-    println!("\n--- Aggregation Map Results ---");
-
+    cfg: &OutputConfig,
+    writer: &mut dyn Write,
+) -> Result<()> {
     let mut key_indices = Vec::new();
     let mut val_indices = Vec::new();
     for (i, spec) in specs.iter().enumerate() {
@@ -329,20 +356,23 @@ pub fn print_map_results(
     // Header
     let mut headers = Vec::new();
     for &i in &key_indices {
-        let prefix = match specs[i].source {
+        let default = match specs[i].source {
             FieldSource::Line => format!("Key_{}", specs[i].capture_index),
             FieldSource::Path => format!("Key_p{}", specs[i].capture_index),
         };
-        headers.push(prefix);
+        headers.push(specs[i].name.clone().unwrap_or(default));
     }
     for &i in &val_indices {
-        let prefix = match specs[i].source {
+        let default = match specs[i].source {
             FieldSource::Line => format!("{:?}_{}", specs[i].role, specs[i].capture_index),
             FieldSource::Path => format!("{:?}_p{}", specs[i].role, specs[i].capture_index),
         };
-        headers.push(prefix);
+        headers.push(specs[i].name.clone().unwrap_or(default));
     }
-    println!("{}", headers.join("\t"));
+
+    let mut sink = make_sink(*cfg, writer)?;
+
+    sink.write_header(&headers)?;
 
     for (key, values) in map {
         let mut parts = Vec::new();
@@ -350,50 +380,52 @@ pub fn print_map_results(
             match k {
                 AggValue::I64(v) => parts.push(v.to_string()),
                 AggValue::U64(v) => parts.push(v.to_string()),
-                AggValue::F64(v) => parts.push(v.0.to_string()),
+                AggValue::F64(v) => parts.push(fmt_float(v.0, cfg.sig_digits)),
                 AggValue::Str(v) => parts.push(v),
-                AggValue::Null => parts.push("".to_string()),
+                AggValue::Null => parts.push(String::new()),
             }
         }
         for v in values {
             match v {
                 AggAccumulator::SumI(x) => parts.push(x.to_string()),
                 AggAccumulator::SumU(x) => parts.push(x.to_string()),
-                AggAccumulator::SumF(x) => parts.push(x.to_string()),
+                AggAccumulator::SumF(x) => parts.push(fmt_float(x, cfg.sig_digits)),
                 AggAccumulator::Count(x) => parts.push(x.to_string()),
                 AggAccumulator::MaxI(x) => parts.push(x.to_string()),
                 AggAccumulator::MaxU(x) => parts.push(x.to_string()),
-                AggAccumulator::MaxF(x) => parts.push(x.to_string()),
+                AggAccumulator::MaxF(x) => parts.push(fmt_float(x, cfg.sig_digits)),
                 AggAccumulator::MaxStr(x) => parts.push(x),
                 AggAccumulator::MinI(x) => parts.push(x.to_string()),
                 AggAccumulator::MinU(x) => parts.push(x.to_string()),
-                AggAccumulator::MinF(x) => parts.push(x.to_string()),
+                AggAccumulator::MinF(x) => parts.push(fmt_float(x, cfg.sig_digits)),
                 AggAccumulator::MinStr(x) => parts.push(x),
                 AggAccumulator::AvgI { sum, count } => {
                     if count > 0 {
-                        parts.push((sum as f64 / count as f64).to_string())
+                        parts.push(fmt_float(sum as f64 / count as f64, cfg.sig_digits))
                     } else {
                         parts.push(String::new())
                     }
                 }
                 AggAccumulator::AvgU { sum, count } => {
                     if count > 0 {
-                        parts.push((sum as f64 / count as f64).to_string())
+                        parts.push(fmt_float(sum as f64 / count as f64, cfg.sig_digits))
                     } else {
                         parts.push(String::new())
                     }
                 }
                 AggAccumulator::AvgF { sum, count } => {
                     if count > 0 {
-                        parts.push((sum / count as f64).to_string())
+                        parts.push(fmt_float(sum / count as f64, cfg.sig_digits))
                     } else {
                         parts.push(String::new())
                     }
                 }
-                AggAccumulator::None => parts.push("".to_string()),
+                AggAccumulator::None => parts.push(String::new()),
             }
         }
-        println!("{}", parts.join("\t"));
+        sink.write_row(&parts)?;
     }
-    println!("-------------------------------");
+
+    sink.finish()?;
+    Ok(())
 }

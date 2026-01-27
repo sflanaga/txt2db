@@ -17,6 +17,17 @@ pub enum AnyRegex {
     Pcre(PcreRegex),
 }
 
+// Normalize paths so user-supplied regexes that assume '/' work on platforms that
+// emit backslashes (e.g., Windows).
+fn normalize_path_for_regex(path: &std::path::Path) -> String {
+    let raw = path.to_string_lossy();
+    if raw.contains('\\') {
+        raw.replace('\\', "/")
+    } else {
+        raw.into_owned()
+    }
+}
+
 impl AnyRegex {
     pub fn captures_len(&self) -> usize {
         match self {
@@ -39,6 +50,27 @@ fn read_cycle_counter() -> u64 {
 fn read_cycle_counter() -> u64 {
     // Fallback for non-x86 (e.g., ARM/M1) - roughly nanoseconds
     std::time::Instant::now().elapsed().as_nanos() as u64
+}
+
+fn fetch_path_caps<'a>(
+    path_cache: &'a mut HashMap<Arc<std::path::PathBuf>, Option<Vec<Option<String>>>>,
+    path_re: &Regex,
+    path_arc: &Arc<std::path::PathBuf>,
+) -> Option<&'a Option<Vec<Option<String>>>> {
+    if !path_cache.contains_key(path_arc) {
+        let p_norm = normalize_path_for_regex(path_arc.as_path());
+        let entry = if let Some(caps) = path_re.captures(&p_norm) {
+            let mut v = Vec::with_capacity(path_re.captures_len());
+            for i in 0..path_re.captures_len() {
+                v.push(caps.get(i).map(|m| m.as_str().to_string()));
+            }
+            Some(v)
+        } else {
+            None
+        };
+        path_cache.insert(path_arc.clone(), entry);
+    }
+    path_cache.get(path_arc)
 }
 
 pub fn run_mapper_worker(
@@ -79,27 +111,6 @@ pub fn run_mapper_worker(
             disable_flags,
         ),
     }
-}
-
-fn fetch_path_caps<'a>(
-    path_cache: &'a mut HashMap<Arc<std::path::PathBuf>, Option<Vec<Option<String>>>>,
-    path_re: &Regex,
-    path_arc: &Arc<std::path::PathBuf>,
-) -> Option<&'a Option<Vec<Option<String>>>> {
-    if !path_cache.contains_key(path_arc) {
-        let p_str = path_arc.to_string_lossy();
-        let entry = if let Some(caps) = path_re.captures(&p_str) {
-            let mut v = Vec::with_capacity(path_re.captures_len());
-            for i in 0..path_re.captures_len() {
-                v.push(caps.get(i).map(|m| m.as_str().to_string()));
-            }
-            Some(v)
-        } else {
-            None
-        };
-        path_cache.insert(path_arc.clone(), entry);
-    }
-    path_cache.get(path_arc)
 }
 
 fn run_mapper_worker_std(
@@ -490,7 +501,6 @@ fn run_mapper_worker_pcre(
 
                     for spec in &specs {
                         // Extract bytes and convert to string for parsing
-                        // This is potentially lossy, matching the behavior of from_utf8_lossy in std mode
                         let raw = match spec.source {
                             FieldSource::Line => {
                                 let raw_bytes = capture
@@ -725,8 +735,8 @@ fn run_db_parser_std(
 
         if let Some(pre) = &path_re {
             if let Some(p) = &path_arc {
-                let p_str = p.to_string_lossy();
-                if let Some(caps) = pre.captures(&p_str) {
+                let p_norm = normalize_path_for_regex(p.as_path());
+                if let Some(caps) = pre.captures(&p_norm) {
                     for col in &columns {
                         if let DbFieldSource::Path(idx) = col.source {
                             let val = caps
@@ -824,8 +834,8 @@ fn run_db_parser_pcre(
 
         if let Some(pre) = &path_re {
             if let Some(p) = &path_arc {
-                let p_str = p.to_string_lossy();
-                if let Some(caps) = pre.captures(&p_str) {
+                let p_norm = normalize_path_for_regex(p.as_path());
+                if let Some(caps) = pre.captures(&p_norm) {
                     for col in &columns {
                         if let DbFieldSource::Path(idx) = col.source {
                             let val = caps

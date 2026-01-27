@@ -2,10 +2,12 @@ use anyhow::{Context, Result};
 use crossbeam_channel::Receiver;
 use rusqlite::{params, types::ValueRef, Connection};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{atomic::Ordering, Arc};
 
 use crate::io_splicer::SplicerStats;
+use crate::output::{fmt_float, make_sink, OutputConfig};
 use crate::stats::{get_iso_time, DbStats, RunMetadata};
 
 #[derive(Clone, Debug)]
@@ -101,7 +103,13 @@ pub fn split_sql_statements(sql: &str) -> Vec<String> {
     stmts
 }
 
-pub fn execute_and_print_sql(conn: &Connection, sql_scripts: &[String], stage: &str) -> Result<()> {
+pub fn execute_and_print_sql(
+    conn: &Connection,
+    sql_scripts: &[String],
+    stage: &str,
+    out_cfg: &OutputConfig,
+    writer: &mut dyn Write,
+) -> Result<()> {
     for (i, script) in sql_scripts.iter().enumerate() {
         if script.trim().is_empty() {
             continue;
@@ -110,12 +118,13 @@ pub fn execute_and_print_sql(conn: &Connection, sql_scripts: &[String], stage: &
         let statements = split_sql_statements(script);
 
         if !statements.is_empty() {
-            println!(
+            writeln!(
+                writer,
                 "--- [Executing {} SQL Block #{} ({} statements)] ---",
                 stage,
                 i + 1,
                 statements.len()
-            );
+            )?;
         }
 
         for stmt_sql in statements {
@@ -131,26 +140,29 @@ pub fn execute_and_print_sql(conn: &Connection, sql_scripts: &[String], stage: &
                     .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
                     .collect();
 
-                println!("> Query: {}", clean_sql);
-                println!("{}", col_names.join("\t"));
-                println!("{}", "-".repeat(col_names.len() * 10));
-
-                let mut rows = stmt.query([])?;
+                writeln!(writer, "> Query: {}", clean_sql)?;
                 let mut row_count = 0;
-                while let Some(row) = rows.next()? {
-                    row_count += 1;
-                    let values: Vec<String> = (0..col_count)
-                        .map(|i| match row.get_ref(i).unwrap() {
-                            ValueRef::Null => "NULL".to_string(),
-                            ValueRef::Integer(i) => i.to_string(),
-                            ValueRef::Real(f) => f.to_string(),
-                            ValueRef::Text(t) => String::from_utf8_lossy(t).to_string(),
-                            ValueRef::Blob(_) => "<BLOB>".to_string(),
-                        })
-                        .collect();
-                    println!("{}", values.join("\t"));
+                {
+                    let mut sink = make_sink(*out_cfg, writer)?;
+                    sink.write_header(&col_names)?;
+
+                    let mut rows = stmt.query([])?;
+                    while let Some(row) = rows.next()? {
+                        row_count += 1;
+                        let values: Vec<String> = (0..col_count)
+                            .map(|i| match row.get_ref(i).unwrap() {
+                                ValueRef::Null => "NULL".to_string(),
+                                ValueRef::Integer(i) => i.to_string(),
+                                ValueRef::Real(f) => fmt_float(f, out_cfg.sig_digits),
+                                ValueRef::Text(t) => String::from_utf8_lossy(t).to_string(),
+                                ValueRef::Blob(_) => "<BLOB>".to_string(),
+                            })
+                            .collect();
+                        sink.write_row(&values)?;
+                    }
+                    sink.finish()?;
                 }
-                println!("({} rows)\n", row_count);
+                writeln!(writer, "({} rows)\n", row_count)?;
             } else {
                 stmt.execute([])?;
             }
@@ -168,6 +180,7 @@ pub fn run_db_worker(
     stats: Arc<DbStats>,
     splicer_stats: Arc<SplicerStats>,
     meta: RunMetadata,
+    out_cfg: OutputConfig,
 ) -> Result<i64> {
     let mut conn = Connection::open(path)?;
 
@@ -187,7 +200,8 @@ pub fn run_db_worker(
 
     // --- PRE-RUN SQL ---
     if !meta.pre_sql.is_empty() {
-        execute_and_print_sql(&conn, &meta.pre_sql, "PRE")?;
+        let mut stdout = std::io::stdout();
+        execute_and_print_sql(&conn, &meta.pre_sql, "PRE", &out_cfg, &mut stdout)?;
     }
 
     // 1. Setup Shared Tables
@@ -309,7 +323,8 @@ pub fn run_db_worker(
 
     // --- POST-RUN SQL ---
     if !meta.post_sql.is_empty() {
-        execute_and_print_sql(&conn, &meta.post_sql, "POST")?;
+        let mut stdout = std::io::stdout();
+        execute_and_print_sql(&conn, &meta.post_sql, "POST", &out_cfg, &mut stdout)?;
     }
 
     Ok(run_id)

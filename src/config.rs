@@ -1,5 +1,18 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+pub enum MapFormat {
+    Tsv,
+    Csv,
+    Comfy,
+}
+
+impl Default for MapFormat {
+    fn default() -> Self {
+        MapFormat::Comfy
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_INFO"), ")"), about)]
@@ -164,6 +177,44 @@ pub struct Cli {
     /// Number of regex parser threads (Only used in DB mode)
     #[arg(short = 'p', long = "parsers", help_heading = "Performance")]
     pub parser_threads: Option<usize>,
+
+    // --- Output ---
+    /// Output format for mapper and SQL results: tsv, csv, comfy
+    #[arg(
+        long = "map-format",
+        value_enum,
+        default_value = "comfy",
+        help_heading = "Output"
+    )]
+    pub map_format: MapFormat,
+
+    /// For comfy output: wrap long cells (mutually exclusive with --comfy-truncate)
+    #[arg(
+        long = "comfy-wrap",
+        help_heading = "Output",
+        conflicts_with = "comfy_truncate"
+    )]
+    pub comfy_wrap: bool,
+
+    /// For comfy output: truncate long cells (mutually exclusive with --comfy-wrap)
+    #[arg(
+        long = "comfy-truncate",
+        help_heading = "Output",
+        conflicts_with = "comfy_wrap"
+    )]
+    pub comfy_truncate: bool,
+
+    /// Significant digits for floating-point output (mapper + SQL)
+    #[arg(
+        long = "sig-digits",
+        default_value_t = 4,
+        help_heading = "Output"
+    )]
+    pub sig_digits: usize,
+
+    /// For TSV output: expand tabs for aligned columns
+    #[arg(long = "expand-tabs", help_heading = "Output")]
+    pub expand_tabs: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
