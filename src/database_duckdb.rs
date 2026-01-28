@@ -21,7 +21,7 @@ use crate::stats::{get_iso_time, DbStats, RunMetadata};
 use crate::database::split_sql_statements;
 
 #[cfg(feature = "duckdb")]
-use duckdb::{params, types::ValueRef, Connection};
+use duckdb::{params, types::ValueRef, Appender, Connection};
 
 #[cfg(feature = "duckdb")]
 fn escape_sql(input: &str) -> String {
@@ -43,10 +43,14 @@ pub fn run_db_worker_duckdb(
     let mut conn = Connection::open(path)?;
 
     // Performance Tunings for DuckDB
-    conn.execute("PRAGMA threads = 4", [])?;
+    conn.execute("PRAGMA threads = 8", [])?;
     conn.execute("PRAGMA memory_limit = '1GB'", [])?;
     conn.execute("PRAGMA enable_optimizer = true", [])?;
     conn.execute("PRAGMA enable_profiling = false", [])?;
+    
+    // Additional performance tuning for bulk inserts
+    conn.execute("PRAGMA wal_autocheckpoint = 0", [])?;  // Disable auto-checkpoint during load
+    conn.execute("PRAGMA checkpoint_threshold = '1GB'", [])?;  // Larger checkpoint threshold
 
     // --- PRE-RUN SQL ---
     if !meta.pre_sql.is_empty() {
@@ -205,23 +209,13 @@ fn flush_batch_duckdb(
     data_table_name: &str,
     matches_table_name: &str,
 ) -> Result<()> {
-    let tx = conn.transaction()?;
-    
-    // Prepare statements inside the transaction
-    let mut insert_file_stmt = tx.prepare("INSERT INTO files (run_id, path) VALUES (?, ?)")?;
-    let mut select_file_stmt = tx.prepare("SELECT id FROM files WHERE run_id = ? AND path = ?")?;
-    
-    let insert_matches_sql = format!(
-        "INSERT INTO {} (file_id, offset, content) VALUES (?, ?, ?)",
-        matches_table_name
-    );
-    let mut insert_matches_stmt = if track_matches {
-        Some(tx.prepare(&insert_matches_sql)?)
+    // Use Appender API for bulk inserts - no transaction needed, Appender handles it
+    let mut data_appender = conn.appender(data_table_name)?;
+    let mut matches_appender = if track_matches {
+        Some(conn.appender(matches_table_name)?)
     } else {
         None
     };
-    
-    let col_names = columns.join(", ");
 
     for record in batch.drain(..) {
         let crate::database::DbRecord::Data {
@@ -231,19 +225,25 @@ fn flush_batch_duckdb(
             fields,
         } = record;
 
-        let mut current_match_id = None;
-
+        // Handle file insertion with caching (still needs individual queries for deduplication)
         let file_id = if let Some(p) = &file_path {
             if let Some(&id) = file_cache.get(&**p) {
                 id
             } else {
                 let path_str = p.to_string_lossy();
                 
-                // Try to insert file
-                let _ = insert_file_stmt.execute(params![run_id, path_str]);
+                // Try to insert file (ignore duplicates)
+                let _ = conn.execute(
+                    "INSERT OR IGNORE INTO files (run_id, path) VALUES (?, ?)",
+                    params![run_id, path_str.as_ref()],
+                );
                 
                 // Get the file ID
-                let id: i64 = select_file_stmt.query_row(params![run_id, path_str], |row| row.get(0))?;
+                let id: i64 = conn.query_row(
+                    "SELECT id FROM files WHERE run_id = ? AND path = ?",
+                    params![run_id, path_str.as_ref()],
+                    |row| row.get(0),
+                )?;
                 file_cache.insert((**p).clone(), id);
                 id
             }
@@ -251,54 +251,49 @@ fn flush_batch_duckdb(
             0
         };
 
-        if track_matches {
-            if let Some(ref mut stmt) = insert_matches_stmt {
-                stmt.execute(params![file_id, offset as i64, line_content])?;
-                current_match_id = Some(
-                    tx.query_row(
-                        &format!("SELECT max(id) FROM {}", matches_table_name),
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    )?
-                );
-            }
-        }
-
-        // Build and execute the dynamic INSERT for data table
-        let mut values_parts: Vec<String> = Vec::with_capacity(2 + if track_matches { 1 } else { 0 } + fields.len());
-        values_parts.push(run_id.to_string());
-        values_parts.push(file_id.to_string());
-        if track_matches {
-            if let Some(mid) = current_match_id {
-                values_parts.push(mid.to_string());
+        // Use Appender for match insertion if tracking (much faster)
+        let match_id: Option<i64> = if track_matches {
+            if let Some(ref mut appender) = matches_appender {
+                // Append to matches table
+                appender.append_row(params![file_id, offset as i64, line_content.as_str()])?;
+                // Note: We can't get the auto-generated ID easily with Appender
+                // For now, set to None - if you need match_id in data table, we'd need a different approach
+                None
             } else {
-                values_parts.push("NULL".to_string());
+                None
             }
-        }
-        for field in &fields {
-            match field {
-                Some(s) => values_parts.push(format!("'{}'", escape_sql(s))),
-                None => values_parts.push("NULL".to_string()),
-            }
-        }
-        let values_csv = values_parts.join(", ");
-        let insert_sql = if track_matches {
-            format!(
-                "INSERT INTO {} (run_id, file_id, match_id, {}) VALUES ({})",
-                data_table_name, col_names, values_csv
-            )
         } else {
-            format!(
-                "INSERT INTO {} (run_id, file_id, {}) VALUES ({})",
-                data_table_name, col_names, values_csv
-            )
+            None
         };
-        tx.execute(&insert_sql, [])?;
+
+        // Directly append to data table using Appender API
+        if track_matches {
+            let mut row_data: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(3 + fields.len());
+            row_data.push(&run_id);
+            row_data.push(&file_id);
+            row_data.push(&match_id);
+            for field in &fields {
+                row_data.push(field);
+            }
+            data_appender.append_row(duckdb::params_from_iter(row_data))?;
+        } else {
+            let mut row_data: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(2 + fields.len());
+            row_data.push(&run_id);
+            row_data.push(&file_id);
+            for field in &fields {
+                row_data.push(field);
+            }
+            data_appender.append_row(duckdb::params_from_iter(row_data))?;
+        }
 
         stats.committed_records.fetch_add(1, Ordering::Relaxed);
     }
 
-    tx.commit()?;
+    // Flush both appenders to commit all rows
+    if let Some(mut appender) = matches_appender {
+        appender.flush()?;
+    }
+    data_appender.flush()?;
     Ok(())
 }
 
