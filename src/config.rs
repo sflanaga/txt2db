@@ -14,6 +14,29 @@ impl Default for MapFormat {
     }
 }
 
+#[derive(ValueEnum, Clone, Copy, Debug)]
+pub enum DbBackend {
+    #[value(name = "sqlite")]
+    Sqlite,
+    #[value(name = "duckdb")]
+    DuckDB,
+}
+
+impl Default for DbBackend {
+    fn default() -> Self {
+        DbBackend::Sqlite
+    }
+}
+
+impl std::fmt::Display for DbBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DbBackend::Sqlite => write!(f, "sqlite"),
+            DbBackend::DuckDB => write!(f, "duckdb"),
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_INFO"), ")"), about)]
 // term_width = 0 means "Auto-detect terminal width".
@@ -128,6 +151,10 @@ pub struct Cli {
     pub disable_operations: Option<String>,
 
     // --- Database Options ---
+    /// Database backend to use [default: sqlite]
+    #[arg(long = "db-backend", value_enum, default_value_t = DbBackend::Sqlite, help_heading = "Database Options")]
+    pub db_backend: DbBackend,
+
     /// Database output file. Defaults to scan_HHMMSS.db
     #[arg(long, help_heading = "Database Options")]
     pub db_path: Option<String>,

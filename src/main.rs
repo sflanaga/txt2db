@@ -17,6 +17,8 @@ use walkdir::WalkDir;
 mod aggregation;
 mod config;
 mod database;
+mod database_sqlite;
+mod database_duckdb;
 mod io_splicer;
 mod output;
 mod parser;
@@ -359,9 +361,13 @@ fn main() -> Result<()> {
             let hour = seconds_in_day / 3600;
             let minute = (seconds_in_day % 3600) / 60;
             let second = seconds_in_day % 60;
-            format!("scan_{:02}{:02}{:02}.db", hour, minute, second)
+            let extension = match cli.db_backend {
+                crate::config::DbBackend::DuckDB => "duckdb",
+                crate::config::DbBackend::Sqlite => "db",
+            };
+            format!("scan_{:02}{:02}{:02}.{}", hour, minute, second, extension)
         });
-        println!("Database: {}", db_filename);
+        println!("Database: {} ({})", db_filename, cli.db_backend);
 
         // Spawn DB Worker
         let batch_size = cli.batch_size;
@@ -370,6 +376,7 @@ fn main() -> Result<()> {
         let db_worker_stats = db_stats.clone();
         let db_splicer_stats = splicer_stats.clone();
         let out_cfg = output_cfg;
+        let db_backend = cli.db_backend;
 
         db_handle = Some(thread::spawn(move || {
             run_db_worker(
@@ -382,6 +389,7 @@ fn main() -> Result<()> {
                 db_splicer_stats,
                 run_meta,
                 out_cfg,
+                db_backend,
             )
         }));
 
