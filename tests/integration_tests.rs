@@ -66,6 +66,7 @@ fn test_basic_log_parsing() -> anyhow::Result<()> {
         .arg(r"(?m)^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[(.*?)\] (.*)$")
         .arg("--fields")
         .arg("1:ts;2:level;3:msg")
+        .arg("db")
         .arg("--db-path")
         .arg(db_path.to_str().unwrap())
         .arg(input_path.to_str().unwrap())
@@ -101,6 +102,7 @@ fn test_gzip_support() -> anyhow::Result<()> {
         .arg(r"ID:(\d+) DATA:(\w+)")
         .arg("--fields")
         .arg("1:item_id;2:val")
+        .arg("db")
         .arg("--db-path")
         .arg(db_path.to_str().unwrap())
         .arg(input_path.to_str().unwrap())
@@ -131,13 +133,14 @@ fn test_path_regex_and_recursion() -> anyhow::Result<()> {
 
     // Run on the root temp dir
     let mut cmd = txt2db_cmd();
-    cmd.arg(temp.path()) // Input is the directory
-        .arg("--path-regex")
+    cmd.arg("--path-regex")
         .arg(r"(server-\d+)") // Extract 'server-01'
         .arg("--regex")
         .arg(r"(\w+)")
         .arg("--fields")
         .arg("p1:hostname;l1:status")
+        .arg("db")
+        .arg(temp.path()) // Input is the directory
         .arg("--db-path")
         .arg(db_path.to_str().unwrap())
         .assert()
@@ -162,9 +165,10 @@ fn test_sql_hooks() -> anyhow::Result<()> {
     let db_path = temp.path().join("hooks.db");
 
     let mut cmd = txt2db_cmd();
-    cmd.arg(input_path.to_str().unwrap())
-        .arg("--regex")
+    cmd.arg("--regex")
         .arg("(.*)")
+        .arg("db")
+        .arg(input_path.to_str().unwrap())
         // Pre-SQL: Create a summary table
         .arg("--pre-sql")
         .arg("CREATE TABLE summary (run_date TEXT); INSERT INTO summary VALUES ('2023-01-01');")
@@ -199,13 +203,14 @@ fn test_file_filter() -> anyhow::Result<()> {
     writeln!(f2, "DATA 2")?;
 
     let mut cmd = txt2db_cmd();
-    cmd.arg(temp.path()) // Scan the temp directory
-        .arg("--regex")
+    cmd.arg("--regex")
         .arg(r"DATA (\d+)")
         .arg("--fields")
         .arg("1:val")
         .arg("--filter")
         .arg(r".*\.log$") // <--- Only process .log files
+        .arg("db")
+        .arg(temp.path()) // Scan the temp directory
         .arg("--db-path")
         .arg(db_path.to_str().unwrap())
         .assert()
@@ -235,6 +240,7 @@ fn test_data_stdin() -> anyhow::Result<()> {
         .arg(r"LINE (\w+)")
         .arg("--fields")
         .arg("1:val")
+        .arg("db")
         .arg("--db-path")
         .arg(db_path.to_str().unwrap())
         .write_stdin(input_data)
@@ -263,6 +269,7 @@ fn test_files_from_stdin() -> anyhow::Result<()> {
         .arg(r"FOUND (\w+)")
         .arg("--fields")
         .arg("1:val")
+        .arg("db")
         .arg("--db-path")
         .arg(db_path.to_str().unwrap())
         .write_stdin(input_list)
@@ -296,6 +303,7 @@ fn test_file_list_argument() -> anyhow::Result<()> {
         .arg(r"DATA (\w+)")
         .arg("--fields")
         .arg("1:val")
+        .arg("db")
         .arg("--db-path")
         .arg(db_path.to_str().unwrap())
         .assert()
@@ -315,11 +323,12 @@ fn test_track_matches() -> anyhow::Result<()> {
     writeln!(f, "This is the full line content")?;
 
     let mut cmd = txt2db_cmd();
-    cmd.arg(input_file.to_str().unwrap())
-        .arg("--regex")
+    cmd.arg("--regex")
         .arg(r"(?i)(full) (line)") // Case insensitive
         .arg("--fields")
         .arg("1:a;2:b")
+        .arg("db")
+        .arg(input_file.to_str().unwrap())
         .arg("--track-matches") // <--- Enable raw content tracking
         .arg("--db-path")
         .arg(db_path.to_str().unwrap())
@@ -353,12 +362,13 @@ fn test_no_recursive() -> anyhow::Result<()> {
     File::create(&sub_file)?.write_all(b"DATA NESTED")?;
 
     let mut cmd = txt2db_cmd();
-    cmd.arg(temp.path())
-        .arg("--no-recursive") // <--- Disable recursion
+    cmd.arg("--no-recursive") // <--- Disable recursion
         .arg("--regex")
         .arg(r"DATA (\w+)")
         .arg("--fields")
         .arg("1:val")
+        .arg("db")
+        .arg(temp.path())
         .arg("--db-path")
         .arg(db_path.to_str().unwrap())
         .assert()
@@ -386,11 +396,12 @@ fn test_map_mode_basic() -> anyhow::Result<()> {
 
     let mut cmd = txt2db_cmd();
     let assert = with_map_tsv(&mut cmd)
-        .arg(input_path.to_str().unwrap())
         .arg("--regex")
         .arg(r"(\w+) (\d+)")
+        .arg("map")
         .arg("-m")
         .arg("1_k_s;2_s_i") // Key=String, Sum=Int
+        .arg(input_path.to_str().unwrap())
         .assert()
         .success();
 
@@ -431,13 +442,14 @@ fn test_map_mode_composite_and_parallel() -> anyhow::Result<()> {
 
     let mut cmd = txt2db_cmd();
     let assert = with_map_tsv(&mut cmd)
-        .arg(input_path.to_str().unwrap())
         .arg("--regex")
         .arg(r"(\w+) (\d+) (\d+)")
+        .arg("map")
         .arg("-m")
         .arg("1_k_s;2_k_i;3_s_i") // Key1=Str, Key2=Int, Sum=Int
         .arg("--map-threads")
         .arg("4") // Force parallel
+        .arg(input_path.to_str().unwrap())
         .assert()
         .success();
 
@@ -472,15 +484,16 @@ fn test_map_mode_exclusive() -> anyhow::Result<()> {
     let db_path = temp.path().join("should_not_exist.db");
 
     let mut cmd = txt2db_cmd();
-    cmd.arg(input_path.to_str().unwrap())
-        .arg("--regex")
+    cmd.arg("--regex")
         .arg(r"DATA (\d+)")
+        .arg("map")
         .arg("-m")
         .arg("1_k_i")
         .arg("--db-path")
         .arg(db_path.to_str().unwrap()) // Should be ignored
+        .arg(input_path.to_str().unwrap())
         .assert()
-        .success();
+        .failure();
 
     assert!(!db_path.exists(), "Database file should not be created in map mode");
     Ok(())
@@ -501,11 +514,12 @@ fn test_map_mode_parse_error_counting() -> anyhow::Result<()> {
 
     let mut cmd = txt2db_cmd();
     let assert = with_map_tsv(&mut cmd)
-        .arg(input_path.to_str().unwrap())
         .arg("--regex")
         .arg(r"(\w+) (\S+)") // Capture everything non-whitespace
+        .arg("map")
         .arg("-m")
         .arg("1_k_s;2_s_i") // Key=String, Sum=Int (Expects Int)
+        .arg(input_path.to_str().unwrap())
         .assert()
         .success();
 
@@ -534,12 +548,13 @@ fn test_stop_on_error() -> anyhow::Result<()> {
     writeln!(f, "A XX")?; // Error
 
     let mut cmd = txt2db_cmd();
-    cmd.arg(input_path.to_str().unwrap())
-        .arg("--regex")
+    cmd.arg("--regex")
         .arg(r"(\w+) (\S+)")
+        .arg("map")
         .arg("-m")
         .arg("1_k_s;2_s_i")
         .arg("-E") // Stop on Error
+        .arg(input_path.to_str().unwrap())
         .assert()
         .failure(); // Should fail with exit code 1
 
@@ -558,13 +573,14 @@ fn test_map_mode_path_regex_positive() -> anyhow::Result<()> {
 
     let mut cmd = txt2db_cmd();
     let assert = with_map_tsv(&mut cmd)
-        .arg(file_path.to_str().unwrap())
         .arg("--path-regex")
         .arg(r"\d{4}-\d{2}-(\d{2})\.log")
         .arg("--regex")
         .arg(r"flush=(\d+) close=(\d+) rename=(\d+)")
+        .arg("map")
         .arg("-m")
         .arg("p1_k_s;1_s_i;2_s_i;3_s_i")
+        .arg(file_path.to_str().unwrap())
         .assert()
         .success();
 
@@ -583,13 +599,14 @@ fn test_map_mode_path_regex_no_match_skips() -> anyhow::Result<()> {
 
     let mut cmd = txt2db_cmd();
     let assert = with_map_tsv(&mut cmd)
-        .arg(file_path.to_str().unwrap())
         .arg("--path-regex")
         .arg(r"\d{4}-\d{2}-(\d{2})\.log")
         .arg("--regex")
         .arg(r"flush=(\d+) close=(\d+) rename=(\d+)")
+        .arg("map")
         .arg("-m")
         .arg("p1_k_s;1_s_i;2_s_i;3_s_i")
+        .arg(file_path.to_str().unwrap())
         .assert()
         .success();
 
@@ -612,13 +629,14 @@ fn test_map_mode_mixed_line_and_path_captures() -> anyhow::Result<()> {
 
     let mut cmd = txt2db_cmd();
     let assert = with_map_tsv(&mut cmd)
-        .arg(file_path.to_str().unwrap())
         .arg("--path-regex")
         .arg(r"server-(\d+)")
         .arg("--regex")
         .arg(r"user=(\w+) count=(\d+)")
+        .arg("map")
         .arg("-m")
         .arg("p1_k_i;1_k_s;2_s_i") // path group 1, line group 1, sum of group 2
+        .arg(file_path.to_str().unwrap())
         .assert()
         .success();
 
@@ -640,11 +658,12 @@ fn test_map_mode_average() -> anyhow::Result<()> {
 
     let mut cmd = txt2db_cmd();
     let assert = with_map_tsv(&mut cmd)
-        .arg(file_path.to_str().unwrap())
         .arg("--regex")
         .arg(r"(\w+) (\d+)")
+        .arg("map")
         .arg("-m")
         .arg("1_k_s;2_a_i")
+        .arg(file_path.to_str().unwrap())
         .assert()
         .success();
 
@@ -662,11 +681,12 @@ fn test_invalid_map_definition_error_message() -> anyhow::Result<()> {
     writeln!(f, "x 1")?;
 
     let mut cmd = txt2db_cmd();
-    cmd.arg(file_path.to_str().unwrap())
-        .arg("--regex")
+    cmd.arg("--regex")
         .arg(r"(\w+) (\d+)")
+        .arg("map")
         .arg("-m")
         .arg("1_z_i") // invalid role
+        .arg(file_path.to_str().unwrap())
         .assert()
         .failure()
         .stderr(contains("Invalid map definition (--map)").and(contains("1_z_i")));
@@ -678,9 +698,10 @@ fn test_invalid_regex_error_message() -> anyhow::Result<()> {
     let mut cmd = txt2db_cmd();
     cmd.arg("--regex")
         .arg("(") // invalid regex
+        .arg("--data-stdin")
+        .arg("db")
         .arg("--db-path")
         .arg("/tmp/nowhere.db") // dummy to satisfy args
-        .arg("--data-stdin")
         .write_stdin("")
         .assert()
         .failure()
@@ -698,13 +719,14 @@ fn test_disable_mapwrite_produces_no_rows() -> anyhow::Result<()> {
 
     let mut cmd = txt2db_cmd();
     let assert = with_map_tsv(&mut cmd)
-        .arg(file_path.to_str().unwrap())
         .arg("--regex")
         .arg(r"(\w+) (\d+)")
-        .arg("-m")
-        .arg("1_k_s;2_s_i")
         .arg("--disable-operations")
         .arg("mapwrite")
+        .arg("map")
+        .arg("-m")
+        .arg("1_k_s;2_s_i")
+        .arg(file_path.to_str().unwrap())
         .assert()
         .success();
 
@@ -725,13 +747,14 @@ fn test_map_mode_path_capture_parse_error_counts() -> anyhow::Result<()> {
 
     let mut cmd = txt2db_cmd();
     let assert = with_map_tsv(&mut cmd)
-        .arg(file_path.to_str().unwrap())
         .arg("--path-regex")
         .arg(r"server-(\w+)") // match "xx" so parse to i64 fails
         .arg("--regex")
         .arg(r"val=(\d+)")
+        .arg("map")
         .arg("-m")
         .arg("p1_k_i;1_s_i")
+        .arg(file_path.to_str().unwrap())
         .assert()
         .success();
 
@@ -757,6 +780,7 @@ fn test_map_mode_files_from_stdin_with_path_regex() -> anyhow::Result<()> {
         .arg(r"\d{4}-\d{2}-(\d{2})\.log")
         .arg("--regex")
         .arg(r"x=(\d+)")
+        .arg("map")
         .arg("-m")
         .arg("p1_k_s;1_s_i")
         .write_stdin(list)
@@ -777,14 +801,15 @@ fn test_map_mode_pcre_line_regex_with_path_regex() -> anyhow::Result<()> {
 
     let mut cmd = txt2db_cmd();
     let assert = with_map_tsv(&mut cmd)
-        .arg(file_path.to_str().unwrap())
         .arg("--pcre2")
         .arg("--path-regex")
         .arg(r"pcreserver-(\d+)")
         .arg("--regex")
         .arg(r"VAL=(\d+)")
+        .arg("map")
         .arg("-m")
         .arg("p1_k_i;1_s_i")
+        .arg(file_path.to_str().unwrap())
         .assert()
         .success();
 
@@ -813,8 +838,7 @@ fn test_filter_and_path_regex_together() -> anyhow::Result<()> {
     File::create(&wrong_host)?.write_all(b"OK 3")?;
 
     let mut cmd = txt2db_cmd();
-    cmd.arg(temp.path())
-        .arg("--filter")
+    cmd.arg("--filter")
         .arg(r".*\.log$") // keep only .log
         .arg("--path-regex")
         .arg(r"host-(\d+)") // extract host id and exclude non-matching hosts
@@ -822,6 +846,8 @@ fn test_filter_and_path_regex_together() -> anyhow::Result<()> {
         .arg(r"(OK) (\d+)")
         .arg("--fields")
         .arg("p1:host;l1:status;l2:val")
+        .arg("db")
+        .arg(temp.path())
         .arg("--db-path")
         .arg(db_path.to_str().unwrap())
         .assert()
@@ -854,11 +880,12 @@ fn test_map_mode_custom_labels() -> anyhow::Result<()> {
 
     let mut cmd = txt2db_cmd();
     let assert = with_map_tsv(&mut cmd)
-        .arg(input.to_str().unwrap())
         .arg("--regex")
         .arg(r"(\w+) (\d+)")
+        .arg("map")
         .arg("-m")
         .arg("1_k_s:name;2_s_i:total")
+        .arg(input.to_str().unwrap())
         .assert()
         .success();
 
@@ -883,6 +910,7 @@ fn test_map_mode_output_formats() -> anyhow::Result<()> {
         .arg("tsv")
         .arg("--regex")
         .arg(r"(\w+) (\d+)")
+        .arg("map")
         .arg("-m")
         .arg("1_k_s;2_s_i")
         .arg(input.to_str().unwrap())
@@ -901,6 +929,7 @@ fn test_map_mode_output_formats() -> anyhow::Result<()> {
         .arg("csv")
         .arg("--regex")
         .arg(r"(\w+) (\d+)")
+        .arg("map")
         .arg("-m")
         .arg("1_k_s;2_s_i")
         .arg(input.to_str().unwrap())
@@ -919,6 +948,7 @@ fn test_map_mode_output_formats() -> anyhow::Result<()> {
         .arg("comfy")
         .arg("--regex")
         .arg(r"(\w+) (\d+)")
+        .arg("map")
         .arg("-m")
         .arg("1_k_s;2_s_i")
         .arg(input.to_str().unwrap())
@@ -947,6 +977,7 @@ fn test_comfy_wrap_and_truncate() -> anyhow::Result<()> {
         .arg("--comfy-wrap")
         .arg("--regex")
         .arg(r"(\w+) (\d+)")
+        .arg("map")
         .arg("-m")
         .arg("1_k_s;2_s_i")
         .arg(input.to_str().unwrap())
@@ -966,6 +997,7 @@ fn test_comfy_wrap_and_truncate() -> anyhow::Result<()> {
         .arg("--comfy-truncate")
         .arg("--regex")
         .arg(r"(\w+) (\d+)")
+        .arg("map")
         .arg("-m")
         .arg("1_k_s;2_s_i")
         .arg(input.to_str().unwrap())
@@ -994,6 +1026,7 @@ fn test_sig_digits_adaptive() -> anyhow::Result<()> {
         .arg("3")
         .arg("--regex")
         .arg(r"(\w+) (\S+)")
+        .arg("map")
         .arg("-m")
         .arg("1_k_s;2_s_f")
         .arg(input.to_str().unwrap())
@@ -1024,6 +1057,7 @@ fn test_expand_tabs_tsv_alignment() -> anyhow::Result<()> {
         .arg("--expand-tabs")
         .arg("--regex")
         .arg(r"(\w+) (\d+)")
+        .arg("map")
         .arg("-m")
         .arg("1_k_s;2_s_i")
         .arg(input.to_str().unwrap())
@@ -1051,6 +1085,7 @@ fn test_csv_quoting() -> anyhow::Result<()> {
         .arg("csv")
         .arg("--regex")
         .arg(r"(.+) (\d+)")
+        .arg("map")
         .arg("-m")
         .arg("1_k_s;2_s_i")
         .arg(input.to_str().unwrap())
@@ -1075,13 +1110,14 @@ fn test_map_path_labels() -> anyhow::Result<()> {
 
     let mut cmd = txt2db_cmd();
     let out = with_map_tsv(&mut cmd)
-        .arg(file_path.to_str().unwrap())
         .arg("--path-regex")
         .arg(r".*/(dir\\w+)")
         .arg("--regex")
         .arg(r"val=(\\d+)")
+        .arg("map")
         .arg("-m")
         .arg("p1_k_s:source;1_s_i:total")
+        .arg(file_path.to_str().unwrap())
         .assert()
         .success()
         .get_output()
@@ -1102,18 +1138,19 @@ fn test_db_output_respects_format_and_sig_digits() -> anyhow::Result<()> {
 
     let db_path = temp.path().join("fmt.db");
     let mut cmd = txt2db_cmd();
-    cmd.arg("--db-path")
-        .arg(db_path.to_str().unwrap())
-        .arg("--regex")
+    cmd.arg("--regex")
         .arg(r"(\\w+) (\\S+)")
         .arg("--fields")
         .arg("1:a;2:b")
-        .arg("--post-sql")
-        .arg("SELECT 1.23456 AS v;")
         .arg("--map-format")
         .arg("tsv")
         .arg("--sig-digits")
         .arg("3")
+        .arg("db")
+        .arg("--db-path")
+        .arg(db_path.to_str().unwrap())
+        .arg("--post-sql")
+        .arg("SELECT 1.23456 AS v;")
         .arg(input.to_str().unwrap())
         .assert()
         .success();
@@ -1147,14 +1184,15 @@ fn test_map_mode_pcre_with_path_and_labels() -> anyhow::Result<()> {
 
     let mut cmd = txt2db_cmd();
     let out = with_map_tsv(&mut cmd)
-        .arg(file_path.to_str().unwrap())
         .arg("--pcre2")
         .arg("--path-regex")
         .arg(r"pcreserver-(\\d+)")
         .arg("--regex")
         .arg(r"VAL=(\\d+)")
+        .arg("map")
         .arg("-m")
         .arg("p1_k_i:server;1_s_i:sum")
+        .arg(file_path.to_str().unwrap())
         .assert()
         .success()
         .get_output()
