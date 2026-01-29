@@ -102,12 +102,12 @@ pub fn run_db_worker_duckdb(
     let matches_table_name = format!("matches_{}", run_id);
 
     if track_matches {
-        conn.execute(&format!("CREATE TABLE {} (id BIGINT PRIMARY KEY, file_id BIGINT, offset BIGINT, content TEXT)", matches_table_name), [])?;
+        conn.execute(&format!("CREATE TABLE {} (id BIGINT PRIMARY KEY, file_id BIGINT, \"offset\" BIGINT, content TEXT)", matches_table_name), [])?;
     }
 
     let mut col_defs = String::new();
     for col in &columns {
-        col_defs.push_str(&format!(", {} TEXT", col));
+        col_defs.push_str(&format!(", \"{}\" TEXT", col));
     }
     let match_id_col = if track_matches {
         ", match_id BIGINT"
