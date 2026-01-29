@@ -19,6 +19,7 @@ pub enum ComfyOverflow {
 #[derive(Clone, Copy, Debug)]
 pub struct OutputConfig {
     pub format: OutputFormat,
+    #[allow(dead_code)]
     pub comfy_overflow: ComfyOverflow,
     pub sig_digits: usize,
     pub expand_tabs: bool,
@@ -179,7 +180,7 @@ struct ComfySink<'a> {
 }
 
 impl<'a> ComfySink<'a> {
-    fn new(cfg: OutputConfig, writer: &'a mut dyn Write) -> Self {
+    fn new(_cfg: OutputConfig, writer: &'a mut dyn Write) -> Self {
         Self {
             writer: BufWriter::new(writer),
             headers: Vec::new(),

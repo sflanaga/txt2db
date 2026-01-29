@@ -1,4 +1,4 @@
-use clap::{Parser, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -39,12 +39,15 @@ impl std::fmt::Display for DbBackend {
 
 #[derive(Parser, Debug)]
 #[command(author, version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_INFO"), ")"), about)]
-// term_width = 0 means "Auto-detect terminal width".
 #[command(term_width = 0)]
+#[command(args_conflicts_with_subcommands = false)]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+
     // --- Input Sources ---
     /// Files or directories to scan. If directories, they are walked recursively.
-    #[arg(value_name = "INPUTS", help_heading = "Input Sources")]
+    #[arg(value_name = "INPUTS", help_heading = "Input Sources", global = true)]
     pub inputs: Vec<PathBuf>,
 
     /// Read list of files from Stdin.
@@ -59,73 +62,30 @@ pub struct Cli {
     #[arg(long = "data-stdin", help_heading = "Input Sources")]
     pub data_stdin: bool,
 
-    // --- Parsing Options ---
-    /// Regular Expression to parse lines.
-    /// Capturing groups are extracted into columns.
-    #[arg(short = 'r', long = "regex", help_heading = "Parsing Options")]
+    // --- Parsing ---
+    /// Regular Expression to parse lines. Capturing groups are extracted into columns.
+    #[arg(short = 'r', long = "regex", help_heading = "Parsing")]
     pub regex: String,
 
     /// Use PCRE2 regex engine instead of the default Rust regex engine.
-    /// This may provide better compatibility for complex Perl-style patterns.
-    #[arg(long = "pcre2", help_heading = "Parsing Options")]
+    #[arg(long = "pcre2", help_heading = "Parsing")]
     pub use_pcre2: bool,
 
-    /// Optional: Regular Expression to parse File Paths.  
-    /// If provided, files not matching this regex are ignored.  
-    /// Capturing groups are extracted into columns.
-    #[arg(
-        long = "path-regex",
-        help_heading = "Parsing Options",
-        verbatim_doc_comment
-    )]
+    /// Optional: Regular Expression to parse File Paths. Capturing groups are extracted into columns.
+    #[arg(long = "path-regex", help_heading = "Parsing", verbatim_doc_comment)]
     pub path_regex: Option<String>,
 
     /// File path filter (regex) for directory walking.
-    /// (Distinct from --path-regex, which extracts fields)
-    #[arg(
-        short = 'f',
-        long = "filter",
-        help_heading = "Parsing Options",
-        verbatim_doc_comment
-    )]
+    #[arg(short = 'f', long = "filter", help_heading = "Parsing", verbatim_doc_comment)]
     pub filter_pattern: Option<String>,
 
     /// Disable recursive directory walking
-    #[arg(long = "no-recursive", help_heading = "Parsing Options")]
+    #[arg(long = "no-recursive", help_heading = "Parsing")]
     pub no_recursive: bool,
 
-    /// Field mapping (e.g., "p1:host;l1:date").
-    /// Prefixes: 'p' for path capture groups, 'l' for line capture groups.
-    /// If omitted, defaults to pf_N (path) and lf_N (line) or f_N.
-    #[arg(
-        short = 'F',
-        long = "fields",
-        help_heading = "Parsing Options",
-        verbatim_doc_comment
-    )]
+    /// Field mapping (e.g., "p1:host;l1:date"). Prefixes: 'p' for path, 'l' for line.
+    #[arg(short = 'F', long = "fields", help_heading = "Parsing", verbatim_doc_comment)]
     pub field_map: Option<String>,
-
-    /// Aggregation map definition (e.g. "1_k_i;2_k_s;5_s_i"; supports path captures like "p1_k_s").
-    /// Mutually exclusive with Database mode.
-    /// Format: index_role_type separated by ;.
-    /// Roles: k=Key, s=Sum, c=Count, x=Max, n=Min, a=Avg.
-    /// Types: i=i64, u=u64, f=f64, s=String.
-    #[arg(
-        short = 'm',
-        long = "map",
-        help_heading = "Parsing Options",
-        verbatim_doc_comment
-    )]
-    pub map_def: Option<String>,
-
-    /// Number of mapper threads to use for aggregation.
-    /// Defaults to half of available CPUs if not set.
-    #[arg(
-        long = "map-threads",
-        help_heading = "Performance",
-        verbatim_doc_comment
-    )]
-    pub map_threads: Option<usize>,
 
     // --- Error Handling ---
     /// Print error location (File, Offset, Capture Group) to stderr as it happens.
@@ -136,46 +96,79 @@ pub struct Cli {
     #[arg(short = 'E', long = "stop-on-error", help_heading = "Error Handling")]
     pub stop_on_error: bool,
 
+    // --- Performance ---
+    /// Stats ticker interval in milliseconds
+    #[arg(long = "ticker", default_value_t = 1000, help_heading = "Performance")]
+    pub ticker_interval: u64,
+
+    /// Number of file splicer threads
+    #[arg(short = 's', long = "splicers", help_heading = "Performance")]
+    pub splicer_threads: Option<usize>,
+
     /// Enable manual internal profiling (Regex vs Parse vs Map time)
     #[arg(long = "profile", help_heading = "Performance")]
     pub profile: bool,
 
-    /// Comma separated list of operations to disable for benchmarking:
-    /// 'regex' (disable regex parsing), 'maptarget' (disable value parsing),
-    /// 'mapwrite' (disable map insertion).
-    #[arg(
-        long = "disable-operations",
-        help_heading = "Performance",
-        verbatim_doc_comment
-    )]
+    /// Comma separated list of operations to disable for benchmarking
+    #[arg(long = "disable-operations", help_heading = "Performance", verbatim_doc_comment)]
     pub disable_operations: Option<String>,
 
-    // --- Database Options ---
-    /// Database backend to use [default: sqlite]
-    #[arg(long = "db-backend", value_enum, default_value_t = DbBackend::Sqlite, help_heading = "Database Options")]
-    pub db_backend: DbBackend,
+    // --- Output ---
+    /// Output format for mapper and SQL results: tsv, csv, comfy
+    #[arg(long = "map-format", value_enum, default_value = "comfy", help_heading = "Output")]
+    pub map_format: MapFormat,
 
-    /// Database output file. Defaults to scan_HHMMSS.db
-    #[arg(long, help_heading = "Database Options")]
+    /// For comfy output: wrap long cells
+    #[arg(long = "comfy-wrap", help_heading = "Output", conflicts_with = "comfy_truncate")]
+    pub comfy_wrap: bool,
+
+    /// For comfy output: truncate long cells
+    #[arg(long = "comfy-truncate", help_heading = "Output", conflicts_with = "comfy_wrap")]
+    pub comfy_truncate: bool,
+
+    /// Significant digits for floating-point output
+    #[arg(long = "sig-digits", default_value_t = 4, help_heading = "Output")]
+    pub sig_digits: usize,
+
+    /// For TSV output: expand tabs for aligned columns
+    #[arg(long = "expand-tabs", help_heading = "Output")]
+    pub expand_tabs: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Database ingestion mode
+    Db(DbOptions),
+    /// Map/aggregation mode
+    Map(MapOptions),
+}
+
+#[derive(Args, Debug)]
+pub struct DbOptions {
+    /// Database output file. Defaults to scan_HHMMSS.db or scan_HHMMSS.duckdb
+    #[arg(long, help_heading = "Database")]
     pub db_path: Option<String>,
 
+    /// Database backend to use
+    #[arg(long = "db-backend", value_enum, default_value_t = DbBackend::Sqlite, help_heading = "Database")]
+    pub db_backend: DbBackend,
+
     /// Enable optional tracking tables (files, matches) to store full context
-    #[arg(long, help_heading = "Database Options")]
+    #[arg(long, help_heading = "Database")]
     pub track_matches: bool,
 
     /// Batch size for DB inserts
-    #[arg(long, default_value = "1000", help_heading = "Database Options")]
+    #[arg(long, default_value = "1000", help_heading = "Database")]
     pub batch_size: usize,
 
-    /// SQLite Cache Size in MB
-    #[arg(
-        long = "cache-mb",
-        default_value_t = 100,
-        help_heading = "Database Options"
-    )]
+    /// SQLite cache size in MB (SQLite only)
+    #[arg(long = "cache-mb", default_value_t = 100, help_heading = "Database")]
     pub cache_mb: i64,
 
-    // --- SQL Hooks ---
+    /// Number of regex parser threads
+    #[arg(short = 'p', long = "parsers", help_heading = "Performance")]
+    pub parser_threads: Option<usize>,
+
     /// Execute SQL string BEFORE scanning starts
     #[arg(long = "pre-sql", help_heading = "SQL Hooks")]
     pub pre_sql: Option<String>,
@@ -191,57 +184,29 @@ pub struct Cli {
     /// Execute SQL script from file AFTER scanning finishes
     #[arg(long = "post-sql-file", help_heading = "SQL Hooks")]
     pub post_sql_file: Option<PathBuf>,
+}
 
-    // --- Performance/System ---
-    /// Stats ticker interval in milliseconds
-    #[arg(long = "ticker", default_value_t = 1000, help_heading = "Performance")]
-    pub ticker_interval: u64,
+impl DbOptions {
+    /// Validate backend-specific options
+    pub fn validate(&self) {
+        if matches!(self.db_backend, DbBackend::DuckDB) && self.cache_mb != 100 {
+            eprintln!("Warning: --cache-mb is SQLite-specific and has no effect with --db-backend duckdb");
+        }
+    }
+}
 
-    /// Number of file splicer threads
-    #[arg(short = 's', long = "splicers", help_heading = "Performance")]
-    pub splicer_threads: Option<usize>,
+#[derive(Args, Debug)]
+pub struct MapOptions {
+    /// Aggregation map definition (e.g. "1_k_i;2_k_s;5_s_i").
+    /// Format: index_role_type separated by ;.
+    /// Roles: k=Key, s=Sum, c=Count, x=Max, n=Min, a=Avg.
+    /// Types: i=i64, u=u64, f=f64, s=String.
+    #[arg(short = 'm', long = "map", help_heading = "Aggregation", verbatim_doc_comment)]
+    pub map_def: String,
 
-    /// Number of regex parser threads (Only used in DB mode)
-    #[arg(short = 'p', long = "parsers", help_heading = "Performance")]
-    pub parser_threads: Option<usize>,
-
-    // --- Output ---
-    /// Output format for mapper and SQL results: tsv, csv, comfy
-    #[arg(
-        long = "map-format",
-        value_enum,
-        default_value = "comfy",
-        help_heading = "Output"
-    )]
-    pub map_format: MapFormat,
-
-    /// For comfy output: wrap long cells (mutually exclusive with --comfy-truncate)
-    #[arg(
-        long = "comfy-wrap",
-        help_heading = "Output",
-        conflicts_with = "comfy_truncate"
-    )]
-    pub comfy_wrap: bool,
-
-    /// For comfy output: truncate long cells (mutually exclusive with --comfy-wrap)
-    #[arg(
-        long = "comfy-truncate",
-        help_heading = "Output",
-        conflicts_with = "comfy_wrap"
-    )]
-    pub comfy_truncate: bool,
-
-    /// Significant digits for floating-point output (mapper + SQL)
-    #[arg(
-        long = "sig-digits",
-        default_value_t = 4,
-        help_heading = "Output"
-    )]
-    pub sig_digits: usize,
-
-    /// For TSV output: expand tabs for aligned columns
-    #[arg(long = "expand-tabs", help_heading = "Output")]
-    pub expand_tabs: bool,
+    /// Number of mapper threads to use for aggregation
+    #[arg(long = "map-threads", help_heading = "Performance")]
+    pub map_threads: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

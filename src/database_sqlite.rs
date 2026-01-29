@@ -24,14 +24,16 @@ use crate::database::split_sql_statements;
 use rusqlite::{params, types::ValueRef, Connection};
 
 #[cfg(feature = "sqlite")]
+#[allow(dead_code)]
 pub struct SqliteConnection {
     conn: Connection,
 }
 
 #[cfg(feature = "sqlite")]
 impl SqliteConnection {
+    #[allow(dead_code)]
     pub fn new(path: &str, cache_mb: i64) -> Result<Self> {
-        let mut conn = Connection::open(path)?;
+        let conn = Connection::open(path)?;
         
         // Performance Tunings
         conn.execute_batch(

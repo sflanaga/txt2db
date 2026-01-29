@@ -21,9 +21,10 @@ use crate::stats::{get_iso_time, DbStats, RunMetadata};
 use crate::database::split_sql_statements;
 
 #[cfg(feature = "duckdb")]
-use duckdb::{params, types::ValueRef, Appender, Connection};
+use duckdb::{params, types::ValueRef, Connection};
 
 #[cfg(feature = "duckdb")]
+#[allow(dead_code)]
 fn escape_sql(input: &str) -> String {
     input.replace('\'', "''")
 }
@@ -45,69 +46,63 @@ pub fn run_db_worker_duckdb(
     // Performance Tunings for DuckDB
     conn.execute("PRAGMA threads = 8", [])?;
     conn.execute("PRAGMA memory_limit = '1GB'", [])?;
-    conn.execute("PRAGMA enable_optimizer = true", [])?;
-    conn.execute("PRAGMA enable_profiling = false", [])?;
-    
-    // Additional performance tuning for bulk inserts
-    conn.execute("PRAGMA wal_autocheckpoint = 0", [])?;  // Disable auto-checkpoint during load
-    conn.execute("PRAGMA checkpoint_threshold = '1GB'", [])?;  // Larger checkpoint threshold
 
     // --- PRE-RUN SQL ---
     if !meta.pre_sql.is_empty() {
         let mut stdout = std::io::stdout();
-        execute_and_print_sql_duckdb(&conn, &meta.pre_sql, "PRE", &out_cfg, &mut stdout)?;
+        if let Err(e) = execute_and_print_sql_duckdb(&conn, &meta.pre_sql, "PRE", &out_cfg, &mut stdout) {
+            eprintln!("PRE SQL error: {}", e);
+        }
     }
 
-    // 1. Setup Shared Tables
+    // 1. Setup Shared Tables - explicit IDs (no sequences)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS runs (
-            id INTEGER PRIMARY KEY,
+            id BIGINT PRIMARY KEY,
             timestamp TEXT,
             command TEXT,
             regex TEXT,
-            files_processed INTEGER DEFAULT 0,
-            files_skipped INTEGER DEFAULT 0,
-            bytes_processed INTEGER DEFAULT 0,
-            match_count INTEGER DEFAULT 0,
+            files_processed BIGINT DEFAULT 0,
+            files_skipped BIGINT DEFAULT 0,
+            bytes_processed BIGINT DEFAULT 0,
+            match_count BIGINT DEFAULT 0,
             finished_at TEXT
         )",
         [],
-    )?;
+    ).or_else(|_| {
+        // Table might already exist, that's fine
+        Ok::<_, duckdb::Error>(0)
+    })?;
+    // Best-effort widen integer counters to BIGINT on existing DBs
+    let _ = conn.execute("ALTER TABLE runs ALTER COLUMN files_processed SET DATA TYPE BIGINT", []);
+    let _ = conn.execute("ALTER TABLE runs ALTER COLUMN files_skipped SET DATA TYPE BIGINT", []);
+    let _ = conn.execute("ALTER TABLE runs ALTER COLUMN bytes_processed SET DATA TYPE BIGINT", []);
+    let _ = conn.execute("ALTER TABLE runs ALTER COLUMN match_count SET DATA TYPE BIGINT", []);
+    // Compute a new run_id and insert explicitly
+    let run_id: i64 = conn
+        .query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM runs", [], |row| row.get::<_, i64>(0))?;
     conn.execute(
-        "INSERT INTO runs (timestamp, command, regex) VALUES (?, ?, ?)",
-        params![meta.created_at, meta.command_args, meta.regex],
+        "INSERT INTO runs (id, timestamp, command, regex) VALUES (?, ?, ?, ?)",
+        params![run_id, meta.created_at, meta.command_args, meta.regex],
     )?;
-    let run_id: i64 = conn.query_row("SELECT max(id) FROM runs", [], |row| row.get::<_, i64>(0))?;
 
-    // Note: DuckDB doesn't support ALTER TABLE ADD COLUMN IF NOT EXISTS the same way
-    // We'll handle this more gracefully
-    let has_run_id: bool = conn.query_row(
-        "SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'files' AND column_name = 'run_id'",
-        [],
-        |row| row.get(0).map(|count: i64| count > 0),
-    ).unwrap_or(false);
-    
-    if has_run_id {
-        // Column already exists
-    } else {
-        conn.execute("ALTER TABLE files ADD COLUMN run_id INTEGER", [])?;
-    }
-    
+    // Create files table (with run_id column included from the start)
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY, run_id INTEGER, path TEXT)",
+        "CREATE TABLE IF NOT EXISTS files (id BIGINT PRIMARY KEY, run_id BIGINT, path TEXT)",
         [],
-    )?;
-    conn.execute(
+    ).or_else(|_| Ok::<_, duckdb::Error>(0))?;
+    
+    let _ = conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_files_run_path ON files(run_id, path)",
         [],
-    )?;
+    );
 
     // 2. Setup Dynamic Tables
     let data_table_name = format!("data_{}", run_id);
     let matches_table_name = format!("matches_{}", run_id);
 
     if track_matches {
-        conn.execute(&format!("CREATE TABLE {} (id INTEGER PRIMARY KEY, file_id INTEGER, offset INTEGER, content TEXT)", matches_table_name), [])?;
+        conn.execute(&format!("CREATE TABLE {} (id BIGINT PRIMARY KEY, file_id BIGINT, offset BIGINT, content TEXT)", matches_table_name), [])?;
     }
 
     let mut col_defs = String::new();
@@ -115,14 +110,14 @@ pub fn run_db_worker_duckdb(
         col_defs.push_str(&format!(", {} TEXT", col));
     }
     let match_id_col = if track_matches {
-        ", match_id INTEGER"
+        ", match_id BIGINT"
     } else {
         ""
     };
 
     conn.execute(
         &format!(
-            "CREATE TABLE {} (id INTEGER PRIMARY KEY, run_id INTEGER, file_id INTEGER{}{})",
+            "CREATE TABLE {} (id BIGINT PRIMARY KEY, run_id BIGINT, file_id BIGINT{}{})",
             data_table_name, match_id_col, col_defs
         ),
         [],
@@ -191,7 +186,9 @@ pub fn run_db_worker_duckdb(
     // --- POST-RUN SQL ---
     if !meta.post_sql.is_empty() {
         let mut stdout = std::io::stdout();
-        execute_and_print_sql_duckdb(&conn, &meta.post_sql, "POST", &out_cfg, &mut stdout)?;
+        if let Err(e) = execute_and_print_sql_duckdb(&conn, &meta.post_sql, "POST", &out_cfg, &mut stdout) {
+            eprintln!("POST SQL error: {}", e);
+        }
     }
 
     Ok(run_id)
@@ -203,13 +200,34 @@ fn flush_batch_duckdb(
     batch: &mut Vec<crate::database::DbRecord>,
     file_cache: &mut HashMap<PathBuf, i64>,
     track_matches: bool,
-    columns: &[String],
+    _columns: &[String],
     stats: &Arc<DbStats>,
     run_id: i64,
     data_table_name: &str,
     matches_table_name: &str,
 ) -> Result<()> {
-    // Use Appender API for bulk inserts - no transaction needed, Appender handles it
+    // Initialize ID counters from current tables
+    let mut data_id: i64 = conn
+        .query_row(
+            &format!("SELECT COALESCE(MAX(id), 0) FROM {}", data_table_name),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    let mut match_id_counter: i64 = if track_matches {
+        conn
+            .query_row(
+                &format!("SELECT COALESCE(MAX(id), 0) FROM {}", matches_table_name),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    // Create appenders
     let mut data_appender = conn.appender(data_table_name)?;
     let mut matches_appender = if track_matches {
         Some(conn.appender(matches_table_name)?)
@@ -225,25 +243,33 @@ fn flush_batch_duckdb(
             fields,
         } = record;
 
-        // Handle file insertion with caching (still needs individual queries for deduplication)
+        // Handle file insertion with caching
         let file_id = if let Some(p) = &file_path {
             if let Some(&id) = file_cache.get(&**p) {
                 id
             } else {
                 let path_str = p.to_string_lossy();
-                
-                // Try to insert file (ignore duplicates)
-                let _ = conn.execute(
-                    "INSERT OR IGNORE INTO files (run_id, path) VALUES (?, ?)",
-                    params![run_id, path_str.as_ref()],
-                );
-                
-                // Get the file ID
-                let id: i64 = conn.query_row(
-                    "SELECT id FROM files WHERE run_id = ? AND path = ?",
-                    params![run_id, path_str.as_ref()],
-                    |row| row.get(0),
-                )?;
+                // Check if file exists, insert if not (manual id)
+                let existing_id: Option<i64> = conn
+                    .query_row(
+                        "SELECT id FROM files WHERE run_id = ? AND path = ?",
+                        params![run_id, path_str.as_ref()],
+                        |row| row.get(0),
+                    )
+                    .ok();
+
+                let id: i64 = if let Some(id) = existing_id {
+                    id
+                } else {
+                    let next_id: i64 = conn
+                        .query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM files", [], |row| row.get(0))
+                        .unwrap_or(1);
+                    conn.execute(
+                        "INSERT INTO files (id, run_id, path) VALUES (?, ?, ?)",
+                        params![next_id, run_id, path_str.as_ref()],
+                    )?;
+                    next_id
+                };
                 file_cache.insert((**p).clone(), id);
                 id
             }
@@ -251,48 +277,54 @@ fn flush_batch_duckdb(
             0
         };
 
-        // Use Appender for match insertion if tracking (much faster)
-        let match_id: Option<i64> = if track_matches {
-            if let Some(ref mut appender) = matches_appender {
-                // Append to matches table
-                appender.append_row(params![file_id, offset as i64, line_content.as_str()])?;
-                // Note: We can't get the auto-generated ID easily with Appender
-                // For now, set to None - if you need match_id in data table, we'd need a different approach
-                None
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Directly append to data table using Appender API
+        // Append match if tracking (manual id)
+        let mut current_match_id: Option<i64> = None;
         if track_matches {
-            let mut row_data: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(3 + fields.len());
+            match_id_counter += 1;
+            if let Some(ref mut app) = matches_appender {
+                app.append_row(params![match_id_counter, file_id, offset as i64, line_content.as_str()])?;
+                current_match_id = Some(match_id_counter);
+            }
+        }
+
+        // Append data row with explicit id and dynamic fields
+        data_id += 1;
+        if track_matches {
+            let mut row_data: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(4 + fields.len());
+            row_data.push(&data_id);
             row_data.push(&run_id);
             row_data.push(&file_id);
-            row_data.push(&match_id);
+            // safe unwrap as we only come here when tracking
+            let mid = current_match_id.unwrap();
+            row_data.push(&mid);
             for field in &fields {
-                row_data.push(field);
+                if let Some(s) = field {
+                    row_data.push(s);
+                } else {
+                    row_data.push(&"");
+                }
             }
-            data_appender.append_row(duckdb::params_from_iter(row_data))?;
+            data_appender.append_row(row_data.as_slice())?;
         } else {
-            let mut row_data: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(2 + fields.len());
+            let mut row_data: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(3 + fields.len());
+            row_data.push(&data_id);
             row_data.push(&run_id);
             row_data.push(&file_id);
             for field in &fields {
-                row_data.push(field);
+                if let Some(s) = field {
+                    row_data.push(s);
+                } else {
+                    row_data.push(&"");
+                }
             }
-            data_appender.append_row(duckdb::params_from_iter(row_data))?;
+            data_appender.append_row(row_data.as_slice())?;
         }
 
         stats.committed_records.fetch_add(1, Ordering::Relaxed);
     }
 
-    // Flush both appenders to commit all rows
-    if let Some(mut appender) = matches_appender {
-        appender.flush()?;
-    }
+    // Flush appenders
+    if let Some(mut app) = matches_appender { app.flush()?; }
     data_appender.flush()?;
     Ok(())
 }
@@ -329,38 +361,45 @@ fn execute_and_print_sql_duckdb(
                 .prepare(clean_sql)
                 .context(format!("Failed to prepare SQL: {}", clean_sql))?;
 
-            if stmt.column_count() > 0 {
-                let col_count = stmt.column_count();
-                let col_names: Vec<String> = (0..col_count)
-                    .map(|i| stmt.column_name(i).map_or("?", |v| v).to_string())
-                    .collect();
-
-                writeln!(writer, "> Query: {}", clean_sql)?;
-                let mut row_count = 0;
-                {
-                    let mut sink = make_sink(*out_cfg, writer)?;
-                    sink.write_header(&col_names)?;
-
-                    let mut rows = stmt.query([])?;
-                    while let Some(row) = rows.next()? {
-                        row_count += 1;
-                        let values: Vec<String> = (0..col_count)
-                            .map(|i| match row.get_ref(i).unwrap() {
-                                ValueRef::Null => "NULL".to_string(),
-                                ValueRef::BigInt(i) => i.to_string(),
-                                ValueRef::Double(f) => fmt_float(f, out_cfg.sig_digits),
-                                ValueRef::Text(t) => String::from_utf8_lossy(t).to_string(),
-                                _ => "<BLOB>".to_string(),
-                            })
-                            .collect();
-                        sink.write_row(&values)?;
+            writeln!(writer, "> Query: {}", clean_sql)?;
+            // Collect rows first to avoid borrowing `writer` during iteration
+            let mut rows = stmt.query([])?;
+            let mut rows_buf: Vec<Vec<String>> = Vec::new();
+            let mut col_count: usize = 0;
+            while let Some(row) = rows.next()? {
+                if col_count == 0 {
+                    // Determine column count using first row
+                    let mut i = 0;
+                    loop {
+                        match row.get_ref(i) {
+                            Ok(_) => i += 1,
+                            Err(_) => break,
+                        }
                     }
-                    sink.finish()?;
+                    col_count = i;
                 }
-                writeln!(writer, "({} rows)\n", row_count)?;
-            } else {
-                stmt.execute([])?;
+                let mut values: Vec<String> = Vec::with_capacity(col_count);
+                for i in 0..col_count {
+                    let s = match row.get_ref(i).unwrap() {
+                        ValueRef::Null => "NULL".to_string(),
+                        ValueRef::BigInt(i) => i.to_string(),
+                        ValueRef::Double(f) => fmt_float(f, out_cfg.sig_digits),
+                        ValueRef::Text(t) => String::from_utf8_lossy(t).to_string(),
+                        _ => "<BLOB>".to_string(),
+                    };
+                    values.push(s);
+                }
+                rows_buf.push(values);
             }
+            let row_count = rows_buf.len();
+            let col_names: Vec<String> = (0..col_count).map(|j| format!("col{}", j + 1)).collect();
+            {
+                let mut sink = make_sink(*out_cfg, writer)?;
+                sink.write_header(&col_names)?;
+                for v in &rows_buf { sink.write_row(v)?; }
+                sink.finish()?;
+            }
+            writeln!(writer, "({} rows)\n", row_count)?;
         }
     }
     Ok(())

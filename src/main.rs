@@ -42,6 +42,17 @@ fn main() -> Result<()> {
     let command_line = raw_args.join(" ");
     let cli = Cli::parse();
 
+    // Extract mode-specific options from subcommand
+    let (map_def, map_threads, db_path, db_backend, track_matches, batch_size, cache_mb, parser_threads, pre_sql, post_sql, pre_sql_file, post_sql_file) = match &cli.command {
+        crate::config::Command::Db(opts) => {
+            opts.validate();
+            (None, None, opts.db_path.clone(), opts.db_backend, opts.track_matches, opts.batch_size, opts.cache_mb, opts.parser_threads, opts.pre_sql.clone(), opts.post_sql.clone(), opts.pre_sql_file.clone(), opts.post_sql_file.clone())
+        }
+        crate::config::Command::Map(opts) => {
+            (Some(opts.map_def.clone()), opts.map_threads, None, crate::config::DbBackend::Sqlite, false, 1000, 100, None, None, None, None, None)
+        }
+    };
+
     // Parsing disable options
     let disable_ops = DisableConfig::from_str(cli.disable_operations.as_deref());
     if cli.disable_operations.is_some() {
@@ -80,18 +91,18 @@ fn main() -> Result<()> {
 
     // Collect Pre/Post SQL
     let mut pre_sql_scripts = Vec::new();
-    if let Some(s) = &cli.pre_sql {
+    if let Some(s) = &pre_sql {
         pre_sql_scripts.push(s.clone());
     }
-    if let Some(p) = &cli.pre_sql_file {
+    if let Some(p) = &pre_sql_file {
         pre_sql_scripts.push(fs::read_to_string(p)?);
     }
 
     let mut post_sql_scripts = Vec::new();
-    if let Some(s) = &cli.post_sql {
+    if let Some(s) = &post_sql {
         post_sql_scripts.push(s.clone());
     }
-    if let Some(p) = &cli.post_sql_file {
+    if let Some(p) = &post_sql_file {
         post_sql_scripts.push(fs::read_to_string(p)?);
     }
 
@@ -121,7 +132,7 @@ fn main() -> Result<()> {
     };
 
     // Setup Map Specs
-    let map_specs = if let Some(def) = &cli.map_def {
+    let map_specs = if let Some(def) = &map_def {
         Some(parse_map_def(def).context(format!("Invalid map definition (--map): '{}'", def))?)
     } else {
         None
@@ -298,7 +309,7 @@ fn main() -> Result<()> {
         regex: cli.regex.clone(),
         command_args: command_line,
         created_at: get_iso_time(),
-        cache_mb: cli.cache_mb,
+        cache_mb,
         pre_sql: pre_sql_scripts,
         post_sql: post_sql_scripts,
     };
@@ -313,8 +324,7 @@ fn main() -> Result<()> {
     if let Some(agg_specs) = map_specs.clone() {
         // --- MAP MODE ---
         // Spawn multiple MAP threads that consume chunks and return BTreeMaps
-        let map_thread_count = cli
-            .map_threads
+        let map_thread_count = map_threads
             .unwrap_or_else(|| std::cmp::max(1, total_cores / 2));
         println!(
             "Starting Aggregation Scan with {} mapper threads...",
@@ -352,7 +362,7 @@ fn main() -> Result<()> {
         }
     } else {
         // --- DB MODE ---
-        let db_filename = cli.db_path.clone().unwrap_or_else(|| {
+        let db_filename = db_path.clone().unwrap_or_else(|| {
             let secs = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -361,22 +371,19 @@ fn main() -> Result<()> {
             let hour = seconds_in_day / 3600;
             let minute = (seconds_in_day % 3600) / 60;
             let second = seconds_in_day % 60;
-            let extension = match cli.db_backend {
+            let extension = match db_backend {
                 crate::config::DbBackend::DuckDB => "duckdb",
                 crate::config::DbBackend::Sqlite => "db",
             };
             format!("scan_{:02}{:02}{:02}.{}", hour, minute, second, extension)
         });
-        println!("Database: {} ({})", db_filename, cli.db_backend);
+        println!("Database: {} ({})", db_filename, db_backend);
 
         // Spawn DB Worker
-        let batch_size = cli.batch_size;
-        let track_matches = cli.track_matches;
         let col_defs_for_db = columns.iter().map(|c| c.name.clone()).collect();
         let db_worker_stats = db_stats.clone();
         let db_splicer_stats = splicer_stats.clone();
         let out_cfg = output_cfg;
-        let db_backend = cli.db_backend;
 
         db_handle = Some(thread::spawn(move || {
             run_db_worker(
@@ -394,8 +401,7 @@ fn main() -> Result<()> {
         }));
 
         // Spawn DB Parsers
-        let parser_count = cli
-            .parser_threads
+        let parser_count = parser_threads
             .unwrap_or_else(|| std::cmp::max(1, total_cores.saturating_sub(splicer_count)));
         for _ in 0..parser_count {
             let rx = splicer_rx.clone();

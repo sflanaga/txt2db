@@ -136,11 +136,14 @@ impl IoSplicer {
         };
 
         self.stats.file_count.fetch_add(1, Ordering::Relaxed);
-        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        let ext = path.extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
 
         let path_arc = Some(Arc::new(path.to_path_buf()));
 
-        match ext {
+        match ext.as_str() {
             "gz" => self.process_reader(BufReader::new(GzDecoder::new(file)), path_arc),
             "bz2" => self.process_reader(BufReader::new(BzDecoder::new(file)), path_arc),
             "zst" => self.process_reader(BufReader::new(ZstdDecoder::new(file)?), path_arc),
