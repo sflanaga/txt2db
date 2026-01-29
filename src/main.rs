@@ -43,13 +43,13 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Extract mode-specific options from subcommand
-    let (map_def, map_threads, db_path, db_backend, track_matches, batch_size, cache_mb, parser_threads, pre_sql, post_sql, pre_sql_file, post_sql_file) = match &cli.command {
+    let (map_def, map_threads, db_path, db_backend, track_matches, batch_size, db_channel_size, cache_mb, duckdb_threads, duckdb_memory_limit, parser_threads, pre_sql, post_sql, pre_sql_file, post_sql_file) = match &cli.command {
         crate::config::Command::Db(opts) => {
             opts.validate();
-            (None, None, opts.db_path.clone(), opts.db_backend, opts.track_matches, opts.batch_size, opts.cache_mb, opts.parser_threads, opts.pre_sql.clone(), opts.post_sql.clone(), opts.pre_sql_file.clone(), opts.post_sql_file.clone())
+            (None, None, opts.db_path.clone(), opts.db_backend, opts.track_matches, opts.batch_size, opts.db_channel_size, opts.cache_mb, opts.duckdb_threads, opts.duckdb_memory_limit.clone(), opts.parser_threads, opts.pre_sql.clone(), opts.post_sql.clone(), opts.pre_sql_file.clone(), opts.post_sql_file.clone())
         }
         crate::config::Command::Map(opts) => {
-            (Some(opts.map_def.clone()), opts.map_threads, None, crate::config::DbBackend::Sqlite, false, 1000, 100, None, None, None, None, None)
+            (Some(opts.map_def.clone()), opts.map_threads, None, crate::config::DbBackend::Sqlite, false, 1000, 65536, 100, 8, "1GB".to_string(), None, None, None, None, None)
         }
     };
 
@@ -218,9 +218,20 @@ fn main() -> Result<()> {
     let total_cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
+
+    // Determine worker thread count first (parser or mapper depending on mode)
+    let worker_count = if map_def.is_some() {
+        // Map mode: use map_threads or default to half of cores
+        map_threads.unwrap_or_else(|| std::cmp::max(1, total_cores / 2))
+    } else {
+        // DB mode: use parser_threads or default to most cores (minus splicers)
+        parser_threads.unwrap_or_else(|| std::cmp::max(1, total_cores.saturating_sub(total_cores / 4)))
+    };
+
+    // Splicer count defaults to 1/4 of worker threads (minimum 1)
     let splicer_count = cli
         .splicer_threads
-        .unwrap_or_else(|| std::cmp::max(1, total_cores / 2));
+        .unwrap_or_else(|| std::cmp::max(1, worker_count / 4));
 
     let path_filter = if let Some(pattern) = cli.filter_pattern {
         Some(Regex::new(&pattern).context("Invalid filter regex (--filter)")?)
@@ -228,9 +239,23 @@ fn main() -> Result<()> {
         None
     };
 
+    // Parse size strings (supports KB, MB suffixes, or plain bytes)
+    let chunk_size = crate::config::parse_size_string(&cli.io_chunk_size)
+        .map_err(|e| anyhow::anyhow!("--io-chunk-size: {}", e))?;
+    let max_buffer_size = crate::config::parse_size_string(&cli.io_max_buffer)
+        .map_err(|e| anyhow::anyhow!("--io-max-buffer: {}", e))?;
+
+    // Validate: max_buffer_size must be > 2 * chunk_size
+    if max_buffer_size < 2 * chunk_size {
+        return Err(anyhow::anyhow!(
+            "--io-max-buffer ({}) must be greater than 2x --io-chunk-size ({} = {} bytes minimum)",
+            cli.io_max_buffer, cli.io_chunk_size, chunk_size * 2
+        ));
+    }
+
     let config = SplicerConfig {
-        chunk_size: 256 * 1024,
-        max_buffer_size: 1024 * 1024,
+        chunk_size,
+        max_buffer_size,
         path_filter,
         thread_count: splicer_count,
     };
@@ -238,11 +263,19 @@ fn main() -> Result<()> {
     let splicer_stats = Arc::new(SplicerStats::default());
     let db_stats = Arc::new(DbStats::default());
 
-    let (splicer_tx, splicer_rx) = bounded::<SplicedChunk>(256);
-    let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(512);
+    // Channel capacities
+    let splicer_cap: usize = 256;
+    let recycle_cap: usize = 512;
+    let db_cap: usize = db_channel_size;
+
+    let (splicer_tx, splicer_rx) = bounded::<SplicedChunk>(splicer_cap);
+    let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(recycle_cap);
 
     // DB Channel (only used in DB mode)
-    let (db_tx, db_rx) = bounded::<DbRecord>(1024*64);
+    let (db_tx, db_rx) = bounded::<DbRecord>(db_cap);
+
+    // Determine if we're in DB mode for ticker display
+    let is_db_mode = map_def.is_none();
 
     let start_time = Instant::now();
 
@@ -292,10 +325,11 @@ fn main() -> Result<()> {
             let display_recs_rate = recs_d as f64 * rate_factor;
 
             if ticker_verbose {
-                // Channel depths
+                // Channel depths and percentages
                 let splicer_depth = mon_splicer_rx.len();
                 let recycle_depth = mon_recycle_rx.len();
-                let db_depth = mon_db_rx.len();
+                let splicer_pct = (splicer_depth as f64 / splicer_cap as f64 * 100.0) as usize;
+                let recycle_pct = (recycle_depth as f64 / recycle_cap as f64 * 100.0) as usize;
 
                 // Additional stats from splicer
                 let chunks = mon_splicer.chunk_count.load(Ordering::Relaxed);
@@ -307,10 +341,20 @@ fn main() -> Result<()> {
                     "Stats: [Files: {}/{} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Matched: {} ({:.0}/s)] [Processed: {} ({:.0}/s)]",
                     files, skipped, display_files_rate, mb_total, display_mb_rate, matched, display_matched_rate, total_items, display_recs_rate
                 );
-                println!(
-                    "       [Chunks: {}] [Errors: {}] [Channels: splicer={} recycle={} db={}] [RecycleMiss: {}]",
-                    chunks, errors, splicer_depth, recycle_depth, db_depth, recycler_misses
-                );
+
+                if is_db_mode {
+                    let db_depth = mon_db_rx.len();
+                    let db_pct = (db_depth as f64 / db_cap as f64 * 100.0) as usize;
+                    println!(
+                        "       [Chunks: {}] [Errors: {}] [Channels: splicer={}% recycle={}% db={}%] [RecycleMiss: {}]",
+                        chunks, errors, splicer_pct, recycle_pct, db_pct, recycler_misses
+                    );
+                } else {
+                    println!(
+                        "       [Chunks: {}] [Errors: {}] [Channels: splicer={}% recycle={}%] [RecycleMiss: {}]",
+                        chunks, errors, splicer_pct, recycle_pct, recycler_misses
+                    );
+                }
             } else {
                 println!(
                     "Stats: [Files: {}/{} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Processed: {} ({:.0}/s)]",
@@ -340,11 +384,12 @@ fn main() -> Result<()> {
     if let Some(agg_specs) = map_specs.clone() {
         // --- MAP MODE ---
         // Spawn multiple MAP threads that consume chunks and return BTreeMaps
-        let map_thread_count = map_threads
-            .unwrap_or_else(|| std::cmp::max(1, total_cores / 2));
+        let map_thread_count = worker_count;
+
+        // Pipeline info message
         println!(
-            "Starting Aggregation Scan with {} mapper threads...",
-            map_thread_count
+            "Pipeline: [Splicers: {}] --(splicer:{})-> [Mappers: {}] --(recycle:{})->"
+            , splicer_count, splicer_cap, map_thread_count, recycle_cap
         );
 
         let show_errors = cli.show_errors;
@@ -433,6 +478,8 @@ fn main() -> Result<()> {
         let db_splicer_stats = splicer_stats.clone();
         let out_cfg = output_cfg;
 
+        let duck_threads = duckdb_threads;
+        let duck_mem = duckdb_memory_limit.clone();
         db_handle = Some(thread::spawn(move || {
             run_db_worker(
                 db_filename,
@@ -445,12 +492,20 @@ fn main() -> Result<()> {
                 run_meta,
                 out_cfg,
                 db_backend,
+                duck_threads,
+                duck_mem,
             )
         }));
 
         // Spawn DB Parsers
-        let parser_count = parser_threads
-            .unwrap_or_else(|| std::cmp::max(1, total_cores.saturating_sub(splicer_count)));
+        let parser_count = worker_count;
+
+        // Pipeline info message
+        println!(
+            "Pipeline: [Splicers: {}] --(splicer:{})-> [Parsers: {}] --(db:{})-> [DB Writer: 1] --(recycle:{})->",
+            splicer_count, splicer_cap, parser_count, db_cap, recycle_cap
+        );
+
         for _ in 0..parser_count {
             let rx = splicer_rx.clone();
             let r_tx = recycle_tx.clone();
@@ -472,7 +527,6 @@ fn main() -> Result<()> {
                 )
             }));
         }
-        println!("Starting DB Ingestion Scan...");
     }
 
     let splicer = IoSplicer::new(config, splicer_stats.clone(), splicer_tx, recycle_rx);

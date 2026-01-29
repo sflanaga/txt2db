@@ -112,6 +112,8 @@ pub fn run_db_worker(
     meta: RunMetadata,
     out_cfg: OutputConfig,
     backend: DbBackend,
+    duckdb_threads: usize,
+    duckdb_memory_limit: String,
 ) -> Result<i64> {
     match backend {
         #[cfg(feature = "sqlite")]
@@ -140,6 +142,8 @@ pub fn run_db_worker(
                 splicer_stats,
                 meta,
                 out_cfg,
+                duckdb_threads,
+                duckdb_memory_limit,
             )
         }
         #[allow(unreachable_patterns)]

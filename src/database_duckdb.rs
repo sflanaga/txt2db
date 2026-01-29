@@ -40,12 +40,14 @@ pub fn run_db_worker_duckdb(
     splicer_stats: Arc<SplicerStats>,
     meta: RunMetadata,
     out_cfg: OutputConfig,
+    duckdb_threads: usize,
+    duckdb_memory_limit: String,
 ) -> Result<i64> {
     let mut conn = Connection::open(path)?;
 
     // Performance Tunings for DuckDB
-    conn.execute("PRAGMA threads = 8", [])?;
-    conn.execute("PRAGMA memory_limit = '1GB'", [])?;
+    conn.execute(&format!("PRAGMA threads = {}", duckdb_threads), [])?;
+    conn.execute(&format!("PRAGMA memory_limit = '{}'", duckdb_memory_limit), [])?;
 
     // --- PRE-RUN SQL ---
     if !meta.pre_sql.is_empty() {

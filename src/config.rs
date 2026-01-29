@@ -1,5 +1,14 @@
+use bytesize::ByteSize;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+
+/// Parse a size string with optional suffix, defaulting to bytes.
+/// Supports: B, K, KB, KiB, M, MB, MiB, G, GB, GiB, etc. (case-insensitive)
+pub fn parse_size_string(s: &str) -> Result<usize, String> {
+    s.parse::<ByteSize>()
+        .map(|bs| bs.as_u64() as usize)
+        .map_err(|_| format!("Invalid size value: {} (e.g., '256KB', '1MB', '1048576')", s))
+}
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
 pub enum OutFormat {
@@ -110,6 +119,14 @@ pub struct Cli {
     #[arg(short = 's', long = "splicers", help_heading = "Performance")]
     pub splicer_threads: Option<usize>,
 
+    /// Target chunk size for I/O splitting (e.g., '256KB', '1MB', or bytes without suffix)
+    #[arg(long = "io-chunk-size", default_value = "256KB", help_heading = "Performance")]
+    pub io_chunk_size: String,
+
+    /// Max buffer size for long line handling (e.g., '1MB', '2048KB', must be > 2x chunk size)
+    #[arg(long = "io-max-buffer", default_value = "1MB", help_heading = "Performance")]
+    pub io_max_buffer: String,
+
     /// Comma separated list of operations to disable for benchmarking
     #[arg(long = "disable-operations", help_heading = "Performance", verbatim_doc_comment)]
     pub disable_operations: Option<String>,
@@ -154,9 +171,21 @@ pub struct DbOptions {
     #[arg(long, default_value = "1000", help_heading = "Database")]
     pub batch_size: usize,
 
+    /// Capacity of the DB record channel (number of records)
+    #[arg(long = "db-channel-size", default_value_t = 65536, help_heading = "Database")]
+    pub db_channel_size: usize,
+
     /// SQLite cache size in MB (SQLite only)
     #[arg(long = "cache-mb", default_value_t = 100, help_heading = "Database")]
     pub cache_mb: i64,
+
+    /// Number of threads for DuckDB internal operations (DuckDB only)
+    #[arg(long = "duckdb-threads", default_value_t = 8, help_heading = "Database")]
+    pub duckdb_threads: usize,
+
+    /// Memory limit for DuckDB (e.g., '2GB', '512MB') (DuckDB only)
+    #[arg(long = "duckdb-memory-limit", default_value = "1GB", help_heading = "Database")]
+    pub duckdb_memory_limit: String,
 
     /// Number of regex parser threads
     #[arg(short = 'p', long = "parsers", help_heading = "Performance")]
@@ -184,6 +213,14 @@ impl DbOptions {
     pub fn validate(&self) {
         if matches!(self.db_backend, DbBackend::DuckDB) && self.cache_mb != 100 {
             eprintln!("Warning: --cache-mb is SQLite-specific and has no effect with --db-backend duckdb");
+        }
+        if matches!(self.db_backend, DbBackend::Sqlite) {
+            if self.duckdb_threads != 8 {
+                eprintln!("Warning: --duckdb-threads is DuckDB-specific and has no effect with SQLite backend");
+            }
+            if self.duckdb_memory_limit != "1GB" {
+                eprintln!("Warning: --duckdb-memory-limit is DuckDB-specific and has no effect with SQLite backend");
+            }
         }
     }
 }

@@ -16,6 +16,7 @@ flate2 = "1.0"
 bzip2 = "0.4"
 zstd = "0.13"
 clap = { version = "4.0", features = ["derive"] }
+bytesize = "2.3"
 rusqlite = { version = "0.36", features = ["bundled"], optional = true }
 duckdb = { version = "1.4", features = ["bundled"], optional = true }
 chrono = "0.4"
