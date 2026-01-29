@@ -102,13 +102,13 @@ pub struct Cli {
     #[arg(long = "ticker", default_value_t = 1000, help_heading = "Performance")]
     pub ticker_interval: u64,
 
+    /// Show verbose ticker stats including channel depths and additional metrics
+    #[arg(long = "ticker-verbose", help_heading = "Performance")]
+    pub ticker_verbose: bool,
+
     /// Number of file splicer threads
     #[arg(short = 's', long = "splicers", help_heading = "Performance")]
     pub splicer_threads: Option<usize>,
-
-    /// Enable manual internal profiling (Regex vs Parse vs Map time)
-    #[arg(long = "profile", help_heading = "Performance")]
-    pub profile: bool,
 
     /// Comma separated list of operations to disable for benchmarking
     #[arg(long = "disable-operations", help_heading = "Performance", verbatim_doc_comment)]

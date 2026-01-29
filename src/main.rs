@@ -28,7 +28,7 @@ use crate::aggregation::{parse_map_def, render_map_results, AggAccumulator, AggV
 use crate::config::{Cli, DisableConfig, OutFormat};
 use crate::database::{run_db_worker, ColumnDef, DbRecord, FieldSource};
 use crate::io_splicer::{IoSplicer, SplicedChunk, SplicerConfig, SplicerStats};
-use crate::output::{fmt_float, OutputConfig, OutputFormat};
+use crate::output::{OutputConfig, OutputFormat};
 use crate::parser::{run_db_parser, run_mapper_worker, AnyRegex};
 use crate::stats::{get_cpu_time_seconds, get_iso_time, DbStats, RunMetadata};
 
@@ -242,19 +242,24 @@ fn main() -> Result<()> {
     let (recycle_tx, recycle_rx) = bounded::<Vec<u8>>(512);
 
     // DB Channel (only used in DB mode)
-    let (db_tx, db_rx) = bounded::<DbRecord>(4096);
+    let (db_tx, db_rx) = bounded::<DbRecord>(1024*64);
 
     let start_time = Instant::now();
 
-    // Ticker
+    // Ticker - clone receivers to check channel lengths
     let mon_splicer = splicer_stats.clone();
     let mon_db = db_stats.clone();
     let tick_duration = Duration::from_millis(cli.ticker_interval);
+    let ticker_verbose = cli.ticker_verbose;
+    let mon_splicer_rx = splicer_rx.clone();
+    let mon_recycle_rx = recycle_rx.clone();
+    let mon_db_rx = db_rx.clone();
 
     thread::spawn(move || {
         let mut last_files = 0;
         let mut last_recs = 0;
         let mut last_bytes = 0;
+        let mut last_matched = 0;
 
         loop {
             thread::sleep(tick_duration);
@@ -265,16 +270,19 @@ fn main() -> Result<()> {
             let commits = mon_db.committed_records.load(Ordering::Relaxed);
             let mapped = mon_db.mapped_records.load(Ordering::Relaxed);
             let total_items = commits + mapped;
+            let matched = mon_db.matched_lines.load(Ordering::Relaxed);
 
             let bytes = mon_db.bytes_processed.load(Ordering::Relaxed);
 
             let files_d = files - last_files;
             let recs_d = total_items - last_recs;
             let bytes_d = bytes - last_bytes;
+            let matched_d = matched - last_matched;
 
             last_files = files;
             last_recs = total_items;
             last_bytes = bytes;
+            last_matched = matched;
 
             let mb_total = bytes as f64 / 1024.0 / 1024.0;
             let mb_rate = bytes_d as f64 / 1024.0 / 1024.0;
@@ -283,10 +291,32 @@ fn main() -> Result<()> {
             let display_files_rate = files_d as f64 * rate_factor;
             let display_recs_rate = recs_d as f64 * rate_factor;
 
-            println!(
-                "Stats: [Files: {}/{} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Processed: {} ({:.0}/s)]",
-                files, skipped, display_files_rate, mb_total, display_mb_rate, total_items, display_recs_rate
-            );
+            if ticker_verbose {
+                // Channel depths
+                let splicer_depth = mon_splicer_rx.len();
+                let recycle_depth = mon_recycle_rx.len();
+                let db_depth = mon_db_rx.len();
+
+                // Additional stats from splicer
+                let chunks = mon_splicer.chunk_count.load(Ordering::Relaxed);
+                let recycler_misses = mon_splicer.recycler_miss_count.load(Ordering::Relaxed);
+                let errors = mon_db.total_errors.load(Ordering::Relaxed);
+                let display_matched_rate = matched_d as f64 * rate_factor;
+
+                println!(
+                    "Stats: [Files: {}/{} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Matched: {} ({:.0}/s)] [Processed: {} ({:.0}/s)]",
+                    files, skipped, display_files_rate, mb_total, display_mb_rate, matched, display_matched_rate, total_items, display_recs_rate
+                );
+                println!(
+                    "       [Chunks: {}] [Errors: {}] [Channels: splicer={} recycle={} db={}] [RecycleMiss: {}]",
+                    chunks, errors, splicer_depth, recycle_depth, db_depth, recycler_misses
+                );
+            } else {
+                println!(
+                    "Stats: [Files: {}/{} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Processed: {} ({:.0}/s)]",
+                    files, skipped, display_files_rate, mb_total, display_mb_rate, total_items, display_recs_rate
+                );
+            }
         }
     });
 
@@ -319,7 +349,6 @@ fn main() -> Result<()> {
 
         let show_errors = cli.show_errors;
         let stop_on_error = cli.stop_on_error;
-        let enable_profiling = cli.profile;
         let flags = Arc::new(disable_ops);
 
         for _ in 0..map_thread_count {
@@ -341,7 +370,6 @@ fn main() -> Result<()> {
                     stats,
                     show_errors,
                     stop_on_error,
-                    enable_profiling,
                     t_flags,
                 )
             }));
