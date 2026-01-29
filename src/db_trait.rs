@@ -82,6 +82,9 @@ pub mod sqlite {
             let cache_pragma = format!("PRAGMA cache_size = -{};", cache_kib);
             conn.execute(&cache_pragma, [])?;
             
+            // Validate connection with a simple query
+            conn.query_row("SELECT 1", [], |_| Ok(()))?;
+            
             Ok(SqliteConnection { conn })
         }
     }
@@ -201,6 +204,9 @@ pub mod duckdb {
             // Performance Tunings for DuckDB
             conn.execute("PRAGMA threads = 4", [])?;
             conn.execute("PRAGMA memory_limit = '1GB'", [])?;
+            
+            // Validate connection with a simple query
+            conn.query_row("SELECT 1", [], |_| Ok(()))?;
             
             Ok(DuckDBConnection { conn })
         }

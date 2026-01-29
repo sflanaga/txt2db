@@ -1,6 +1,7 @@
-use predicates::Predicate;
 use assert_cmd::Command;
 use rusqlite::Connection;
+#[cfg(feature = "duckdb")]
+use duckdb;
 use std::fs::{self, File};
 use std::io::Write;
 use tempfile::TempDir;
@@ -866,8 +867,6 @@ fn test_filter_and_path_regex_together() -> anyhow::Result<()> {
     Ok(())
 }
 
-use predicates::str::is_match;
-
 // --- Additional tests for output/formatting features ---
 
 #[test]
@@ -1201,6 +1200,389 @@ fn test_map_mode_pcre_with_path_and_labels() -> anyhow::Result<()> {
     let s = std::str::from_utf8(&out)?;
     assert!(s.contains("server\tsum"));
     assert!(s.contains("77\t123"));
+    Ok(())
+}
+
+// --- Database Safety Check Tests ---
+// Note: Some tests require --features duckdb to run
+
+// --- DuckDB-specific tests (equivalents of SQLite tests) ---
+
+#[test]
+#[cfg(feature = "duckdb")]
+fn test_duckdb_basic_log_parsing() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let input_path = temp.path().join("app.log");
+    let db_path = temp.path().join("basic_test.duckdb");
+
+    // 1. Create dummy data
+    let mut file = File::create(&input_path)?;
+    writeln!(file, "2023-01-01 10:00:00 [INFO] User logged in")?;
+    writeln!(file, "2023-01-01 10:05:00 [ERROR] Connection failed")?;
+
+    // 2. Run txt2db with DuckDB backend
+    let mut cmd = txt2db_cmd();
+    cmd.arg("--regex")
+        .arg(r"(?m)^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[(.*?)\] (.*)$")
+        .arg("--fields")
+        .arg("1:ts;2:level;3:msg")
+        .arg("db")
+        .arg("--db-backend")
+        .arg("duckdb")
+        .arg("--db-path")
+        .arg(db_path.to_str().unwrap())
+        .arg(input_path.to_str().unwrap())
+        .assert()
+        .success();
+
+    // 3. Verify Database using DuckDB
+    let conn = duckdb::Connection::open(db_path.to_str().unwrap()).expect("failed to open duckdb");
+    let count: i64 = conn.query_row("SELECT count(*) FROM data", [], |row| row.get(0))?;
+    assert_eq!(count, 2, "Should have 2 rows");
+
+    let level: String = conn.query_row(
+        "SELECT level FROM data WHERE msg = 'Connection failed'", 
+        [], 
+        |row| row.get(0)
+    )?;
+    assert_eq!(level, "ERROR");
+
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "duckdb")]
+fn test_duckdb_track_matches() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let input_file = temp.path().join("test.log");
+    let db_path = temp.path().join("track.duckdb");
+
+    let mut f = File::create(&input_file)?;
+    writeln!(f, "This is the full line content")?;
+
+    let mut cmd = txt2db_cmd();
+    cmd.arg("--regex")
+        .arg(r"This is (.*)")
+        .arg("--fields")
+        .arg("1:a;2:b")
+        .arg("db")
+        .arg("--db-backend")
+        .arg("duckdb")
+        .arg(input_file.to_str().unwrap())
+        .arg("--track-matches")
+        .arg("--db-path")
+        .arg(db_path.to_str().unwrap())
+        .assert()
+        .success();
+
+    // Check 'matches' table exists and has content
+    let conn = duckdb::Connection::open(db_path.to_str().unwrap()).expect("failed to open duckdb");
+    let count: i64 = conn.query_row("SELECT count(*) FROM matches", [], |row| row.get(0))?;
+    assert_eq!(count, 1);
+
+    let content: String = conn.query_row("SELECT content FROM matches", [], |r| r.get(0))?;
+    assert_eq!(content, "This is the full line content");
+
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "duckdb")]
+fn test_duckdb_pre_post_sql() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let input_path = temp.path().join("dummy.txt");
+    let mut file = File::create(&input_path)?;
+    writeln!(file, "ignore me")?;
+
+    let db_path = temp.path().join("hooks.duckdb");
+
+    let mut cmd = txt2db_cmd();
+    cmd.arg("--regex")
+        .arg("(.*)")
+        .arg("db")
+        .arg("--db-backend")
+        .arg("duckdb")
+        .arg("--db-path")
+        .arg(db_path.to_str().unwrap())
+        // Pre-SQL: Create a table
+        .arg("--pre-sql")
+        .arg("CREATE TABLE summary (run_date TEXT); INSERT INTO summary VALUES ('2023-01-01');")
+        // Post-SQL: Update it
+        .arg("--post-sql")
+        .arg("UPDATE summary SET run_date = 'FINISHED'")
+        .arg(input_path.to_str().unwrap())
+        .assert()
+        .success();
+
+    // Verify the table created by PRE-SQL exists and was updated by POST-SQL
+    let conn = duckdb::Connection::open(db_path.to_str().unwrap()).expect("failed to open duckdb");
+    let val: String = conn.query_row("SELECT run_date FROM summary", [], |r| r.get(0))?;
+    assert_eq!(val, "FINISHED");
+
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "duckdb")]
+fn test_duckdb_reserved_keywords() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let input_path = temp.path().join("keywords.log");
+    let mut file = File::create(&input_path)?;
+    writeln!(file, "offset=123 rename=456")?;
+
+    let db_path = temp.path().join("keywords.duckdb");
+
+    // Use field names that are reserved keywords in DuckDB
+    let mut cmd = txt2db_cmd();
+    cmd.arg("--regex")
+        .arg(r"offset=(\d+) rename=(\d+)")
+        .arg("--fields")
+        .arg("1:offset;2:rename")  // Both are reserved in DuckDB
+        .arg("db")
+        .arg("--db-backend")
+        .arg("duckdb")
+        .arg("--db-path")
+        .arg(db_path.to_str().unwrap())
+        .arg(input_path.to_str().unwrap())
+        .assert()
+        .success();
+
+    // Verify data was inserted correctly with quoted column names
+    let conn = duckdb::Connection::open(db_path.to_str().unwrap()).expect("failed to open duckdb");
+    let offset: i64 = conn.query_row(r#"SELECT "offset" FROM data"#, [], |r| r.get(0))?;
+    assert_eq!(offset, 123);
+    
+    let rename: i64 = conn.query_row(r#"SELECT "rename" FROM data"#, [], |r| r.get(0))?;
+    assert_eq!(rename, 456);
+
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "duckdb")]
+fn test_duckdb_data_stdin() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let db_path = temp.path().join("stdin.duckdb");
+
+    // Simulate piping raw data via stdin
+    let input_data = "LINE One\nLINE Two\nLINE Three";
+
+    let mut cmd = txt2db_cmd();
+    cmd.arg("--regex")
+        .arg(r"LINE (\w+)")
+        .arg("--fields")
+        .arg("1:val")
+        .arg("--data-stdin")
+        .arg("db")
+        .arg("--db-backend")
+        .arg("duckdb")
+        .arg("--db-path")
+        .arg(db_path.to_str().unwrap())
+        .write_stdin(input_data)
+        .assert()
+        .success();
+
+    let conn = duckdb::Connection::open(db_path.to_str().unwrap()).expect("failed to open duckdb");
+    let count: i64 = conn.query_row("SELECT count(*) FROM data", [], |row| row.get(0))?;
+    assert_eq!(count, 3);
+    
+    Ok(())
+}
+
+#[test]
+fn test_extension_mismatch_warning() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let db_path = temp.path().join("mismatch.duckdb");
+    
+    let mut cmd = txt2db_cmd();
+    let assert = cmd.arg("--regex")
+        .arg("(.*)")
+        .arg("--data-stdin")
+        .arg("db")
+        .arg("--db-backend")
+        .arg("sqlite")
+        .arg("--db-path")
+        .arg(db_path.to_str().unwrap())
+        .write_stdin("test line")
+        .assert();
+    
+    // Should contain warning about extension mismatch
+    let output = assert.get_output();
+    let stderr = std::str::from_utf8(&output.stderr)?;
+    let stdout = std::str::from_utf8(&output.stdout)?;
+    
+    // Check both stderr and stdout for the warning
+    let warning = "Warning: Database file extension '.duckdb' does not match expected '.db' for sqlite";
+    assert!(stderr.contains(warning) || stdout.contains(warning), 
+            "Warning not found in stderr or stdout. stderr='{}', stdout='{}'", stderr, stdout);
+    
+    Ok(())
+}
+
+#[test]
+fn test_file_exists_warning() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let db_path = temp.path().join("existing.db");
+    
+    // Create initial database
+    {
+        let mut cmd = txt2db_cmd();
+        cmd.arg("--regex")
+            .arg("(.*)")
+            .arg("--data-stdin")
+            .arg("db")
+            .arg("--db-path")
+            .arg(db_path.to_str().unwrap())
+            .write_stdin("first line")
+            .assert()
+            .success();
+    }
+    
+    // Try to write to the same database again
+    let mut cmd = txt2db_cmd();
+    let assert = cmd.arg("--regex")
+        .arg("(.*)")
+        .arg("--data-stdin")
+        .arg("db")
+        .arg("--db-path")
+        .arg(db_path.to_str().unwrap())
+        .write_stdin("second line")
+        .assert();
+    
+    // Should contain warning about existing file
+    let output = assert.get_output();
+    let stderr = std::str::from_utf8(&output.stderr)?;
+    assert!(stderr.contains("Warning: Database file already exists. Appending to existing database."));
+    
+    Ok(())
+}
+
+#[test]
+fn test_sqlite_file_with_duckdb_backend_error() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let db_path = temp.path().join("test.db");
+    
+    // Create a SQLite database first
+    {
+        let mut cmd = txt2db_cmd();
+        cmd.arg("--regex")
+            .arg("(.*)")
+            .arg("--data-stdin")
+            .arg("db")
+            .arg("--db-backend")
+            .arg("sqlite")
+            .arg("--db-path")
+            .arg(db_path.to_str().unwrap())
+            .write_stdin("test line")
+            .assert()
+            .success();
+    }
+    
+    // Try to open the SQLite file with DuckDB backend
+    let mut cmd = txt2db_cmd();
+    let assert = cmd.arg("--regex")
+        .arg("(.*)")
+        .arg("--data-stdin")
+        .arg("db")
+        .arg("--db-backend")
+        .arg("duckdb")
+        .arg("--db-path")
+        .arg(db_path.to_str().unwrap())
+        .write_stdin("test line")
+        .assert()
+        .failure();
+    
+    // Should contain error about wrong backend (if DuckDB is enabled)
+    let output = assert.get_output();
+    let stderr = std::str::from_utf8(&output.stderr)?;
+    if stderr.contains("Database backend DuckDB not enabled") {
+        // Can't test backend detection if DuckDB is not enabled
+        return Ok(());
+    }
+    assert!(stderr.contains("Cannot open SQLite database with DuckDB backend"));
+    
+    Ok(())
+}
+
+#[test]
+fn test_non_sqlite_file_with_sqlite_backend_error() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let db_path = temp.path().join("notsqlite.duckdb");
+    
+    // Create a DuckDB database first (skip if not enabled)
+    {
+        let mut cmd = txt2db_cmd();
+        let result = cmd.arg("--regex")
+            .arg("(.*)")
+            .arg("--data-stdin")
+            .arg("db")
+            .arg("--db-backend")
+            .arg("duckdb")
+            .arg("--db-path")
+            .arg(db_path.to_str().unwrap())
+            .write_stdin("test line")
+            .assert();
+            
+        let output = result.get_output();
+        let stderr = std::str::from_utf8(&output.stderr)?;
+        if stderr.contains("Database backend DuckDB not enabled") {
+            // Skip test if DuckDB is not enabled
+            return Ok(());
+        }
+        // If we get here, the database was created successfully
+    }
+    
+    // Try to open the DuckDB file with SQLite backend
+    let mut cmd = txt2db_cmd();
+    let assert = cmd.arg("--regex")
+        .arg("(.*)")
+        .arg("--data-stdin")
+        .arg("db")
+        .arg("--db-backend")
+        .arg("sqlite")
+        .arg("--db-path")
+        .arg(db_path.to_str().unwrap())
+        .write_stdin("test line")
+        .assert()
+        .failure();
+    
+    // Should contain error about not being a SQLite database
+    let output = assert.get_output();
+    let stderr = std::str::from_utf8(&output.stderr)?;
+    assert!(stderr.contains("File does not appear to be a SQLite database"));
+    
+    Ok(())
+}
+
+#[test]
+fn test_invalid_database_file_handling() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let db_path = temp.path().join("invalid.db");
+    
+    // Create an invalid file (not a database)
+    {
+        let mut f = File::create(&db_path)?;
+        writeln!(f, "This is not a database file")?;
+    }
+    
+    // Try to open with SQLite backend
+    let mut cmd = txt2db_cmd();
+    let assert = cmd.arg("--regex")
+        .arg("(.*)")
+        .arg("--data-stdin")
+        .arg("db")
+        .arg("--db-path")
+        .arg(db_path.to_str().unwrap())
+        .write_stdin("test line")
+        .assert()
+        .failure();
+    
+    // Should fail due to invalid database
+    let output = assert.get_output();
+    let stderr = std::str::from_utf8(&output.stderr)?;
+    assert!(stderr.contains("File does not appear to be a SQLite database") || 
+            stderr.contains("file is encrypted or is not a database"));
+    
     Ok(())
 }
 

@@ -14,7 +14,7 @@ impl Default for MapFormat {
     }
 }
 
-#[derive(ValueEnum, Clone, Copy, Debug)]
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq)]
 pub enum DbBackend {
     #[value(name = "sqlite")]
     Sqlite,

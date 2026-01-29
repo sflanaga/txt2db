@@ -5,8 +5,8 @@ use regex::Regex;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader};
-use std::path::PathBuf;
+use std::io::{self, BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -378,6 +378,40 @@ fn main() -> Result<()> {
             format!("scan_{:02}{:02}{:02}.{}", hour, minute, second, extension)
         });
         println!("Database: {} ({})", db_filename, db_backend);
+
+        // Safety checks for database file
+        let db_path = Path::new(&db_filename);
+        
+        // Check if file extension matches backend
+        if let Some(ext) = db_path.extension().and_then(|e| e.to_str()) {
+            let expected_ext = match db_backend {
+                crate::config::DbBackend::DuckDB => "duckdb",
+                crate::config::DbBackend::Sqlite => "db",
+            };
+            if ext != expected_ext && ext != "sqlite" && ext != "sqlite3" {
+                eprintln!("Warning: Database file extension '.{}' does not match expected '.{}' for {}", 
+                    ext, expected_ext, db_backend);
+            }
+        }
+        
+        // Check if file already exists
+        if db_path.exists() {
+            eprintln!("Warning: Database file already exists. Appending to existing database.");
+            
+            // Validate it's the correct backend type
+            if let Ok(mut file) = File::open(db_path) {
+                let mut header = [0; 16];
+                if file.read_exact(&mut header).is_ok() {
+                    let header_str = std::str::from_utf8(&header).unwrap_or("");
+                    if header_str.starts_with("SQLite format 3") && db_backend == crate::config::DbBackend::DuckDB {
+                        return Err(anyhow::anyhow!("Cannot open SQLite database with DuckDB backend. Use --db-backend sqlite or provide a different file path."));
+                    } else if !header_str.starts_with("SQLite format 3") && db_backend == crate::config::DbBackend::Sqlite {
+                        // DuckDB files don't start with SQLite header
+                        return Err(anyhow::anyhow!("File does not appear to be a SQLite database. Use --db-backend duckdb or provide a SQLite file."));
+                    }
+                }
+            }
+        }
 
         // Spawn DB Worker
         let col_defs_for_db = columns.iter().map(|c| c.name.clone()).collect();
