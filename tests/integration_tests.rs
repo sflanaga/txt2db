@@ -1018,9 +1018,10 @@ fn test_sig_digits_adaptive() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let input = temp.path().join("sig.txt");
     let mut f = File::create(&input)?;
+    // Use different keys so values are output individually, not summed
     writeln!(f, "A 123.456")?;
-    writeln!(f, "A 0.0004567")?;
-    writeln!(f, "A 120000000")?;
+    writeln!(f, "B 0.0004567")?;
+    writeln!(f, "C 120000000")?;
 
     let mut cmd = txt2db_cmd();
     let out = with_map_tsv(&mut cmd)
@@ -1038,9 +1039,9 @@ fn test_sig_digits_adaptive() -> anyhow::Result<()> {
         .stdout
         .clone();
     let s = std::str::from_utf8(&out)?;
-    assert!(s.contains("123")); // fixed with 3 sig digits
-    assert!(s.contains("0.000457")); // fixed small with 3 sig digits
-    assert!(s.contains("1.20e+08")); // scientific for large with 3 sig digits
+    assert!(s.contains("123"), "Expected '123' in output: {}", s); // fixed with 3 sig digits
+    assert!(s.contains("0.000457"), "Expected '0.000457' in output: {}", s); // fixed small with 3 sig digits
+    assert!(s.contains("1.20e+08"), "Expected '1.20e+08' in output: {}", s); // scientific for large with 3 sig digits
     Ok(())
 }
 

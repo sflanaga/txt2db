@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use crate::aggregation::{AggAccumulator, AggRole, AggValue, FieldSource, MapFieldSpec};
+use crate::aggregation::{AggAccumulator, AggRole, AggValue, AggFieldSource, MapFieldSpec};
 use crate::config::DisableConfig;
 use crate::database::{ColumnDef, DbRecord, FieldSource as DbFieldSource};
 use crate::io_splicer::SplicedChunk;
@@ -48,8 +48,12 @@ fn read_cycle_counter() -> u64 {
 
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 fn read_cycle_counter() -> u64 {
-    // Fallback for non-x86 (e.g., ARM/M1) - roughly nanoseconds
-    std::time::Instant::now().elapsed().as_nanos() as u64
+    // Fallback for non-x86 (e.g., ARM/M1) - use system time in nanoseconds
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 fn fetch_path_caps<'a>(
@@ -223,11 +227,11 @@ fn run_mapper_worker_std(
 
                 for spec in &specs {
                     let raw = match spec.source {
-                        FieldSource::Line => capture
+                        AggFieldSource::Line => capture
                             .get(spec.capture_index)
                             .map(|m| m.as_str())
                             .unwrap_or(""),
-                        FieldSource::Path => path_caps
+                        AggFieldSource::Path => path_caps
                             .and_then(|caps| {
                                 caps.get(spec.capture_index).and_then(|o| o.as_deref())
                             })
@@ -312,11 +316,11 @@ fn run_mapper_worker_std(
 
                 for spec in &specs {
                     let raw = match spec.source {
-                        FieldSource::Line => capture
+                        AggFieldSource::Line => capture
                             .get(spec.capture_index)
                             .map(|m| m.as_str())
                             .unwrap_or(""),
-                        FieldSource::Path => path_caps
+                        AggFieldSource::Path => path_caps
                             .and_then(|caps| {
                                 caps.get(spec.capture_index).and_then(|o| o.as_deref())
                             })
@@ -502,14 +506,14 @@ fn run_mapper_worker_pcre(
                     for spec in &specs {
                         // Extract bytes and convert to string for parsing
                         let raw = match spec.source {
-                            FieldSource::Line => {
+                            AggFieldSource::Line => {
                                 let raw_bytes = capture
                                     .get(spec.capture_index)
                                     .map(|m| m.as_bytes())
                                     .unwrap_or(&[]);
                                 String::from_utf8_lossy(raw_bytes)
                             }
-                            FieldSource::Path => path_caps
+                            AggFieldSource::Path => path_caps
                                 .and_then(|caps| {
                                     caps.get(spec.capture_index).and_then(|o| o.as_deref())
                                 })
@@ -596,14 +600,14 @@ fn run_mapper_worker_pcre(
 
                     for spec in &specs {
                         let raw = match spec.source {
-                            FieldSource::Line => {
+                            AggFieldSource::Line => {
                                 let raw_bytes = capture
                                     .get(spec.capture_index)
                                     .map(|m| m.as_bytes())
                                     .unwrap_or(&[]);
                                 String::from_utf8_lossy(raw_bytes)
                             }
-                            FieldSource::Path => path_caps
+                            AggFieldSource::Path => path_caps
                                 .and_then(|caps| {
                                     caps.get(spec.capture_index).and_then(|o| o.as_deref())
                                 })

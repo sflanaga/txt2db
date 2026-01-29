@@ -117,7 +117,7 @@ pub struct Cli {
     // --- Output ---
     /// Output format for results: tsv, csv, box, compact
     #[arg(long = "out-format", value_enum, default_value = "box", help_heading = "Output")]
-    pub map_format: OutFormat,
+    pub out_format: OutFormat,
 
     /// Significant digits for floating-point output
     #[arg(long = "sig-digits", default_value_t = 4, help_heading = "Output")]

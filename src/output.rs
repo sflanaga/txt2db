@@ -14,7 +14,6 @@ pub enum OutputFormat {
 #[derive(Clone, Copy, Debug)]
 pub struct OutputConfig {
     pub format: OutputFormat,
-    #[allow(dead_code)]
     pub sig_digits: usize,
     pub expand_tabs: bool,
 }

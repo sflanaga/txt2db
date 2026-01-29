@@ -23,7 +23,7 @@ pub enum AggType {
 }
 
 #[derive(Clone, Debug, PartialEq, Copy)]
-pub enum FieldSource {
+pub enum AggFieldSource {
     Line,
     Path,
 }
@@ -33,7 +33,7 @@ pub struct MapFieldSpec {
     pub capture_index: usize,
     pub role: AggRole,
     pub dtype: AggType,
-    pub source: FieldSource,
+    pub source: AggFieldSource,
     pub name: Option<String>, // Optional custom header from --map (e.g., p1_k_s:source)
 }
 
@@ -286,19 +286,19 @@ pub fn parse_map_def(def: &str) -> Result<Vec<MapFieldSpec>> {
             );
         }
 
-        let mut source = FieldSource::Line;
+        let mut source = AggFieldSource::Line;
         let mut idx_str = tokens[0];
         if let Some(rest) = idx_str.strip_prefix('p') {
-            source = FieldSource::Path;
+            source = AggFieldSource::Path;
             idx_str = rest;
         } else if let Some(rest) = idx_str.strip_prefix('P') {
-            source = FieldSource::Path;
+            source = AggFieldSource::Path;
             idx_str = rest;
         } else if let Some(rest) = idx_str.strip_prefix('l') {
-            source = FieldSource::Line;
+            source = AggFieldSource::Line;
             idx_str = rest;
         } else if let Some(rest) = idx_str.strip_prefix('L') {
-            source = FieldSource::Line;
+            source = AggFieldSource::Line;
             idx_str = rest;
         }
         let idx: usize = idx_str.trim().parse().map_err(|e| {
@@ -357,15 +357,15 @@ pub fn render_map_results(
     let mut headers = Vec::new();
     for &i in &key_indices {
         let default = match specs[i].source {
-            FieldSource::Line => format!("Key_{}", specs[i].capture_index),
-            FieldSource::Path => format!("Key_p{}", specs[i].capture_index),
+            AggFieldSource::Line => format!("Key_{}", specs[i].capture_index),
+            AggFieldSource::Path => format!("Key_p{}", specs[i].capture_index),
         };
         headers.push(specs[i].name.clone().unwrap_or(default));
     }
     for &i in &val_indices {
         let default = match specs[i].source {
-            FieldSource::Line => format!("{:?}_{}", specs[i].role, specs[i].capture_index),
-            FieldSource::Path => format!("{:?}_p{}", specs[i].role, specs[i].capture_index),
+            AggFieldSource::Line => format!("{:?}_{}", specs[i].role, specs[i].capture_index),
+            AggFieldSource::Path => format!("{:?}_p{}", specs[i].role, specs[i].capture_index),
         };
         headers.push(specs[i].name.clone().unwrap_or(default));
     }

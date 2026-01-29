@@ -60,19 +60,12 @@ fn main() -> Result<()> {
     }
 
     // Output config
-    if let OutFormat::Box = cli.map_format {
-        // ok
-    } else if let OutFormat::Compact = cli.map_format {
-        // ok
-    }
-    if let OutFormat::Tsv = cli.map_format {
-        // ok
-    } else if cli.expand_tabs {
+    if !matches!(cli.out_format, OutFormat::Tsv) && cli.expand_tabs {
         eprintln!("Warning: --expand-tabs only applies to --out-format=tsv");
     }
 
     let output_cfg = OutputConfig {
-        format: match cli.map_format {
+        format: match cli.out_format {
             OutFormat::Tsv => OutputFormat::Tsv,
             OutFormat::Csv => OutputFormat::Csv,
             OutFormat::Box => OutputFormat::Box,
@@ -565,15 +558,6 @@ fn main() -> Result<()> {
 
         let mut stdout = std::io::stdout();
         render_map_results(final_map, map_specs.unwrap(), &output_cfg, &mut stdout)?;
-        println!();
-
-
-        // Demonstrate adaptive float formatting across magnitudes (helps validate sig-digits behavior).
-        let demo_med = fmt_float(123.456, output_cfg.sig_digits);
-        let demo_small = fmt_float(0.000_456_7, output_cfg.sig_digits);
-        let demo_large = fmt_float(120_000_000.0, output_cfg.sig_digits);
-        println!("Format samples: {}, {}, {}", demo_med, demo_small, demo_large);
-
         println!();
     }
 
