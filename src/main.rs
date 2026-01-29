@@ -25,10 +25,10 @@ mod parser;
 mod stats;
 
 use crate::aggregation::{parse_map_def, render_map_results, AggAccumulator, AggValue};
-use crate::config::{Cli, DisableConfig, MapFormat};
+use crate::config::{Cli, DisableConfig, OutFormat};
 use crate::database::{run_db_worker, ColumnDef, DbRecord, FieldSource};
 use crate::io_splicer::{IoSplicer, SplicedChunk, SplicerConfig, SplicerStats};
-use crate::output::{fmt_float, ComfyOverflow, OutputConfig, OutputFormat};
+use crate::output::{fmt_float, OutputConfig, OutputFormat};
 use crate::parser::{run_db_parser, run_mapper_worker, AnyRegex};
 use crate::stats::{get_cpu_time_seconds, get_iso_time, DbStats, RunMetadata};
 
@@ -60,31 +60,24 @@ fn main() -> Result<()> {
     }
 
     // Output config
-    let comfy_overflow = if cli.comfy_wrap {
-        ComfyOverflow::Wrap
-    } else if cli.comfy_truncate {
-        ComfyOverflow::Truncate
-    } else {
-        ComfyOverflow::None
-    };
-    if let MapFormat::Comfy = cli.map_format {
+    if let OutFormat::Box = cli.map_format {
         // ok
-    } else if cli.comfy_wrap || cli.comfy_truncate {
-        eprintln!("Warning: --comfy-wrap/--comfy-truncate only apply when --map-format=comfy");
+    } else if let OutFormat::Compact = cli.map_format {
+        // ok
     }
-    if let MapFormat::Tsv = cli.map_format {
+    if let OutFormat::Tsv = cli.map_format {
         // ok
     } else if cli.expand_tabs {
-        eprintln!("Warning: --expand-tabs only applies to --map-format=tsv");
+        eprintln!("Warning: --expand-tabs only applies to --out-format=tsv");
     }
 
     let output_cfg = OutputConfig {
         format: match cli.map_format {
-            MapFormat::Tsv => OutputFormat::Tsv,
-            MapFormat::Csv => OutputFormat::Csv,
-            MapFormat::Comfy => OutputFormat::Comfy,
+            OutFormat::Tsv => OutputFormat::Tsv,
+            OutFormat::Csv => OutputFormat::Csv,
+            OutFormat::Box => OutputFormat::Box,
+            OutFormat::Compact => OutputFormat::Compact,
         },
-        comfy_overflow,
         sig_digits: cli.sig_digits,
         expand_tabs: cli.expand_tabs,
     };

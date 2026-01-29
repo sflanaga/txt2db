@@ -6,21 +6,15 @@ use tabwriter::TabWriter;
 pub enum OutputFormat {
     Tsv,
     Csv,
-    Comfy,
+    Box,
+    Compact,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum ComfyOverflow {
-    None,
-    Wrap,
-    Truncate,
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct OutputConfig {
     pub format: OutputFormat,
     #[allow(dead_code)]
-    pub comfy_overflow: ComfyOverflow,
     pub sig_digits: usize,
     pub expand_tabs: bool,
 }
@@ -118,7 +112,8 @@ pub fn make_sink<'a>(
             let wtr = csv::WriterBuilder::new().from_writer(writer);
             Ok(Box::new(CsvSink { writer: wtr }))
         }
-        OutputFormat::Comfy => Ok(Box::new(ComfySink::new(cfg, writer))),
+        OutputFormat::Box => Ok(Box::new(BoxSink::new(writer))),
+        OutputFormat::Compact => Ok(Box::new(CompactSink::new(writer))),
     }
 }
 
@@ -172,15 +167,15 @@ impl<'a> TableSink for CsvSink<'a> {
     }
 }
 
-// --- Comfy Sink ---
-struct ComfySink<'a> {
+// --- Box Sink (using tabled) ---
+struct BoxSink<'a> {
     writer: BufWriter<&'a mut dyn Write>,
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
 }
 
-impl<'a> ComfySink<'a> {
-    fn new(_cfg: OutputConfig, writer: &'a mut dyn Write) -> Self {
+impl<'a> BoxSink<'a> {
+    fn new(writer: &'a mut dyn Write) -> Self {
         Self {
             writer: BufWriter::new(writer),
             headers: Vec::new(),
@@ -189,7 +184,7 @@ impl<'a> ComfySink<'a> {
     }
 }
 
-impl<'a> TableSink for ComfySink<'a> {
+impl<'a> TableSink for BoxSink<'a> {
     fn write_header(&mut self, headers: &[String]) -> Result<()> {
         self.headers = headers.to_vec();
         Ok(())
@@ -201,84 +196,75 @@ impl<'a> TableSink for ComfySink<'a> {
     }
     
     fn finish(&mut self) -> Result<()> {
-        if !self.headers.is_empty() {
-            // Calculate maximum width for each column
-            let mut col_widths: Vec<usize> = self.headers.iter()
-                .map(|h| h.len().max(3)) // minimum width of 3
-                .collect();
+        if !self.headers.is_empty() || !self.rows.is_empty() {
+            // Determine the maximum number of columns
+            let max_cols = self.headers.len().max(
+                self.rows.iter().map(|r| r.len()).max().unwrap_or(0)
+            );
             
-            // Update widths based on row content
+            // Calculate maximum width for each column
+            let mut col_widths: Vec<usize> = vec![0; max_cols];
+            
+            // Check headers
+            for (i, header) in self.headers.iter().enumerate() {
+                if i < max_cols {
+                    col_widths[i] = col_widths[i].max(header.len());
+                }
+            }
+            
+            // Check all rows
             for row in &self.rows {
                 for (i, cell) in row.iter().enumerate() {
-                    if i < col_widths.len() {
+                    if i < max_cols {
                         col_widths[i] = col_widths[i].max(cell.len());
-                    } else {
-                        // Handle rows with more columns than headers
-                        col_widths.push(cell.len().max(3));
                     }
                 }
             }
             
-            // Build the table manually with proper alignment
+            // Ensure minimum width of 3 for each column
+            for width in &mut col_widths {
+                *width = (*width).max(3);
+            }
+            
+            // Build table string
             let mut table_str = String::new();
             
-            // Find the maximum number of columns
-            let max_cols = col_widths.len().max(
-                self.rows.iter()
-                    .map(|r| r.len())
-                    .max()
-                    .unwrap_or(0)
-            );
-            
-            // Add top border
-            table_str.push_str("╭");
-            for i in 0..max_cols {
+            // Create top border
+            table_str.push_str("┌");
+            for (i, &width) in col_widths.iter().enumerate() {
                 if i > 0 { table_str.push_str("┬"); }
-                let width = if i < col_widths.len() {
-                    col_widths[i]
-                } else {
-                    3 // minimum width for extra columns
-                };
-                table_str.push_str(&"─".repeat(width + 2)); // +2 for padding
-            }
-            table_str.push_str("╮\n");
-            
-            // Add headers
-            table_str.push_str("│");
-            for (i, header) in self.headers.iter().enumerate() {
-                let width = col_widths.get(i).unwrap_or(&10);
-                table_str.push_str(&format!(" {:^width$} ", header, width = width));
-                if i < self.headers.len() - 1 {
-                    table_str.push_str("│");
-                }
-            }
-            table_str.push_str("│\n");
-            
-            // Add separator
-            table_str.push_str("├");
-            for i in 0..max_cols {
-                if i > 0 { table_str.push_str("┼"); }
-                let width = if i < col_widths.len() {
-                    col_widths[i]
-                } else {
-                    3 // minimum width for extra columns
-                };
                 table_str.push_str(&"─".repeat(width + 2));
             }
-            table_str.push_str("┤\n");
+            table_str.push_str("┐\n");
             
-            // Add rows
+            // Add header row if exists
+            if !self.headers.is_empty() {
+                table_str.push_str("│");
+                for (i, header) in self.headers.iter().enumerate() {
+                    let width = col_widths.get(i).unwrap_or(&3);
+                    table_str.push_str(&format!(" {:^width$} ", header, width = width));
+                    if i < max_cols - 1 {
+                        table_str.push_str("│");
+                    }
+                }
+                table_str.push_str("│\n");
+                
+                // Add separator
+                table_str.push_str("├");
+                for (i, &width) in col_widths.iter().enumerate() {
+                    if i > 0 { table_str.push_str("┼"); }
+                    table_str.push_str(&"─".repeat(width + 2));
+                }
+                table_str.push_str("┤\n");
+            }
+            
+            // Add data rows
             for row in &self.rows {
                 table_str.push_str("│");
                 for (i, cell) in row.iter().enumerate() {
-                    let width = if i < col_widths.len() { 
-                        col_widths[i] 
-                    } else { 
-                        cell.len().max(3)
-                    };
+                    let width = col_widths.get(i).unwrap_or(&3);
                     table_str.push_str(&format!(" {:<width$} ", cell, width = width));
-                    // Add separator if not the last column
-                    if i < row.len() - 1 {
+                    if i < max_cols - 1 {
                         table_str.push_str("│");
                     }
                 }
@@ -286,19 +272,104 @@ impl<'a> TableSink for ComfySink<'a> {
             }
             
             // Add bottom border
-            table_str.push_str("╰");
-            for i in 0..max_cols {
+            table_str.push_str("└");
+            for (i, &width) in col_widths.iter().enumerate() {
                 if i > 0 { table_str.push_str("┴"); }
-                let width = if i < col_widths.len() {
-                    col_widths[i]
-                } else {
-                    3 // minimum width for extra columns
-                };
                 table_str.push_str(&"─".repeat(width + 2));
             }
-            table_str.push_str("╯");
+            table_str.push_str("┘");
             
-            self.writer.write_all(table_str.as_bytes())?;
+            write!(self.writer, "{}", table_str)?;
+        }
+        self.writer.flush()?;
+        Ok(())
+    }
+}
+
+// --- Compact Sink (using tabled without borders) ---
+struct CompactSink<'a> {
+    writer: BufWriter<&'a mut dyn Write>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+}
+
+impl<'a> CompactSink<'a> {
+    fn new(writer: &'a mut dyn Write) -> Self {
+        Self {
+            writer: BufWriter::new(writer),
+            headers: Vec::new(),
+            rows: Vec::new(),
+        }
+    }
+}
+
+impl<'a> TableSink for CompactSink<'a> {
+    fn write_header(&mut self, headers: &[String]) -> Result<()> {
+        self.headers = headers.to_vec();
+        Ok(())
+    }
+    
+    fn write_row(&mut self, row: &[String]) -> Result<()> {
+        self.rows.push(row.to_vec());
+        Ok(())
+    }
+    
+    fn finish(&mut self) -> Result<()> {
+        if !self.headers.is_empty() || !self.rows.is_empty() {
+            // Determine the maximum number of columns
+            let max_cols = self.headers.len().max(
+                self.rows.iter().map(|r| r.len()).max().unwrap_or(0)
+            );
+            
+            // Calculate maximum width for each column
+            let mut col_widths: Vec<usize> = vec![0; max_cols];
+            
+            // Check headers
+            for (i, header) in self.headers.iter().enumerate() {
+                if i < max_cols {
+                    col_widths[i] = col_widths[i].max(header.len());
+                }
+            }
+            
+            // Check all rows
+            for row in &self.rows {
+                for (i, cell) in row.iter().enumerate() {
+                    if i < max_cols {
+                        col_widths[i] = col_widths[i].max(cell.len());
+                    }
+                }
+            }
+            
+            // Build all rows
+            let mut all_rows = Vec::new();
+            
+            // Add header row if exists
+            if !self.headers.is_empty() {
+                let mut header_cells = self.headers.clone();
+                while header_cells.len() < max_cols {
+                    header_cells.push("".to_string());
+                }
+                all_rows.push(header_cells);
+            }
+            
+            // Add data rows
+            for row in &self.rows {
+                let mut row_cells = row.clone();
+                while row_cells.len() < max_cols {
+                    row_cells.push("".to_string());
+                }
+                all_rows.push(row_cells);
+            }
+            
+            // Output with proper alignment (space-separated, not tabs)
+            for row in &all_rows {
+                for (i, cell) in row.iter().enumerate() {
+                    if i > 0 { write!(self.writer, "  ")?; }
+                    let width = col_widths.get(i).unwrap_or(&0);
+                    write!(self.writer, "{:<width$}", cell, width = width)?;
+                }
+                writeln!(self.writer)?;
+            }
         }
         self.writer.flush()?;
         Ok(())

@@ -19,9 +19,9 @@ fn txt2db_cmd() -> Command {
     Command::new(env!("CARGO_BIN_EXE_txt2db"))
 }
 
-// Force mapper output to TSV (default is now comfy)
+// Force mapper output to TSV (default is now box)
 fn with_map_tsv(cmd: &mut Command) -> &mut Command {
-    cmd.arg("--map-format").arg("tsv")
+    cmd.arg("--out-format").arg("tsv")
 }
 
 /// Helper to get a single cell value from the DB
@@ -905,7 +905,7 @@ fn test_map_mode_output_formats() -> anyhow::Result<()> {
     // TSV
     let mut cmd = txt2db_cmd();
     let out_tsv = cmd
-        .arg("--map-format")
+        .arg("--out-format")
         .arg("tsv")
         .arg("--regex")
         .arg(r"(\w+) (\d+)")
@@ -924,7 +924,7 @@ fn test_map_mode_output_formats() -> anyhow::Result<()> {
     // CSV
     let mut cmd = txt2db_cmd();
     let out_csv = cmd
-        .arg("--map-format")
+        .arg("--out-format")
         .arg("csv")
         .arg("--regex")
         .arg(r"(\w+) (\d+)")
@@ -940,11 +940,11 @@ fn test_map_mode_output_formats() -> anyhow::Result<()> {
     let s_csv = std::str::from_utf8(&out_csv)?;
     assert!(s_csv.contains("A,1"));
 
-    // Comfy
+    // Box
     let mut cmd = txt2db_cmd();
-    let out_comfy = cmd
-        .arg("--map-format")
-        .arg("comfy")
+    let out_box = cmd
+        .arg("--out-format")
+        .arg("box")
         .arg("--regex")
         .arg(r"(\w+) (\d+)")
         .arg("map")
@@ -956,13 +956,15 @@ fn test_map_mode_output_formats() -> anyhow::Result<()> {
         .get_output()
         .stdout
         .clone();
-    let s_comfy = std::str::from_utf8(&out_comfy)?;
-    assert!(s_comfy.contains("╭") && s_comfy.contains("╯"));
+    let s_box = std::str::from_utf8(&out_box)?;
+    assert!(s_box.contains("┌") && s_box.contains("└"));
     Ok(())
 }
 
+// Test removed since --comfy-wrap and --comfy-truncate options no longer exist
+/*
 #[test]
-fn test_comfy_wrap_and_truncate() -> anyhow::Result<()> {
+fn test_compact_wrap_and_truncate() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let input = temp.path().join("wrap.txt");
     let mut f = File::create(&input)?;
@@ -971,8 +973,8 @@ fn test_comfy_wrap_and_truncate() -> anyhow::Result<()> {
     // Wrap
     let mut cmd = txt2db_cmd();
     let out_wrap = cmd
-        .arg("--map-format")
-        .arg("comfy")
+        .arg("--out-format")
+        .arg("compact")
         .arg("--comfy-wrap")
         .arg("--regex")
         .arg(r"(\w+) (\d+)")
@@ -991,8 +993,8 @@ fn test_comfy_wrap_and_truncate() -> anyhow::Result<()> {
     // Truncate
     let mut cmd = txt2db_cmd();
     let out_trunc = cmd
-        .arg("--map-format")
-        .arg("comfy")
+        .arg("--out-format")
+        .arg("compact")
         .arg("--comfy-truncate")
         .arg("--regex")
         .arg(r"(\w+) (\d+)")
@@ -1009,6 +1011,7 @@ fn test_comfy_wrap_and_truncate() -> anyhow::Result<()> {
     assert!(s_trunc.contains("long"));
     Ok(())
 }
+*/
 
 #[test]
 fn test_sig_digits_adaptive() -> anyhow::Result<()> {
@@ -1051,7 +1054,7 @@ fn test_expand_tabs_tsv_alignment() -> anyhow::Result<()> {
 
     let mut cmd = txt2db_cmd();
     let out = cmd
-        .arg("--map-format")
+        .arg("--out-format")
         .arg("tsv")
         .arg("--expand-tabs")
         .arg("--regex")
@@ -1080,7 +1083,7 @@ fn test_csv_quoting() -> anyhow::Result<()> {
 
     let mut cmd = txt2db_cmd();
     let out = cmd
-        .arg("--map-format")
+        .arg("--out-format")
         .arg("csv")
         .arg("--regex")
         .arg(r"(.+) (\d+)")
@@ -1141,7 +1144,7 @@ fn test_db_output_respects_format_and_sig_digits() -> anyhow::Result<()> {
         .arg(r"(\\w+) (\\S+)")
         .arg("--fields")
         .arg("1:a;2:b")
-        .arg("--map-format")
+        .arg("--out-format")
         .arg("tsv")
         .arg("--sig-digits")
         .arg("3")
@@ -1160,7 +1163,7 @@ fn test_db_output_respects_format_and_sig_digits() -> anyhow::Result<()> {
 // #[test]
 // fn test_comfy_options_warning_with_other_formats() -> anyhow::Result<()> {
 //     let mut cmd = txt2db_cmd();
-//     cmd.arg("--map-format")
+//     cmd.arg("--out-format")
 //         .arg("csv")
 //         .arg("--comfy-wrap")
 //         .arg("--regex")

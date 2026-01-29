@@ -2,15 +2,16 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
-pub enum MapFormat {
+pub enum OutFormat {
     Tsv,
     Csv,
-    Comfy,
+    Box,
+    Compact,
 }
 
-impl Default for MapFormat {
+impl Default for OutFormat {
     fn default() -> Self {
-        MapFormat::Comfy
+        OutFormat::Box
     }
 }
 
@@ -114,17 +115,9 @@ pub struct Cli {
     pub disable_operations: Option<String>,
 
     // --- Output ---
-    /// Output format for mapper and SQL results: tsv, csv, comfy
-    #[arg(long = "map-format", value_enum, default_value = "comfy", help_heading = "Output")]
-    pub map_format: MapFormat,
-
-    /// For comfy output: wrap long cells
-    #[arg(long = "comfy-wrap", help_heading = "Output", conflicts_with = "comfy_truncate")]
-    pub comfy_wrap: bool,
-
-    /// For comfy output: truncate long cells
-    #[arg(long = "comfy-truncate", help_heading = "Output", conflicts_with = "comfy_wrap")]
-    pub comfy_truncate: bool,
+    /// Output format for results: tsv, csv, box, compact
+    #[arg(long = "out-format", value_enum, default_value = "box", help_heading = "Output")]
+    pub map_format: OutFormat,
 
     /// Significant digits for floating-point output
     #[arg(long = "sig-digits", default_value_t = 4, help_heading = "Output")]
