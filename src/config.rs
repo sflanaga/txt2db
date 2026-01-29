@@ -10,6 +10,200 @@ pub fn parse_size_string(s: &str) -> Result<usize, String> {
         .map_err(|_| format!("Invalid size value: {} (e.g., '256KB', '1MB', '1048576')", s))
 }
 
+// =============================================================================
+// Unified Field Specification Types
+// =============================================================================
+
+/// Data type for field values
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum DataType {
+    #[default]
+    String,  // s, string
+    I64,     // i, int
+    F64,     // f, float
+}
+
+impl DataType {
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s.to_lowercase().as_str() {
+            "s" | "string" | "str" => Ok(DataType::String),
+            "i" | "int" | "i64" | "bigint" => Ok(DataType::I64),
+            "f" | "float" | "f64" | "double" => Ok(DataType::F64),
+            _ => Err(format!("Invalid type '{}': use s/string, i/int, or f/float", s)),
+        }
+    }
+
+    pub fn sql_type(&self) -> &'static str {
+        match self {
+            DataType::String => "TEXT",
+            DataType::I64 => "BIGINT",
+            DataType::F64 => "DOUBLE",
+        }
+    }
+}
+
+/// Aggregation operation for map mode
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AggOp {
+    Key,     // k, key
+    Sum,     // sum (not 's' to avoid conflict with string type)
+    Avg,     // a, avg
+    Count,   // c, count
+    Max,     // x, max
+    Min,     // n, min
+}
+
+impl AggOp {
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s.to_lowercase().as_str() {
+            "k" | "key" => Ok(AggOp::Key),
+            "sum" => Ok(AggOp::Sum),
+            "a" | "avg" | "average" => Ok(AggOp::Avg),
+            "c" | "count" => Ok(AggOp::Count),
+            "x" | "max" => Ok(AggOp::Max),
+            "n" | "min" => Ok(AggOp::Min),
+            _ => Err(format!("Invalid operation '{}': use k/key, sum, a/avg, c/count, x/max, n/min", s)),
+        }
+    }
+}
+
+/// Source of field data (line regex capture or path regex capture)
+#[derive(Clone, Debug, PartialEq)]
+pub enum FieldSource {
+    Line(usize),   // l1, l2, ... (capture index from line regex)
+    Path(usize),   // p1, p2, ... (capture index from path regex)
+    None,          // _ (for count operation, no source needed)
+}
+
+impl FieldSource {
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        if s == "_" {
+            return Ok(FieldSource::None);
+        }
+        if let Some(idx_str) = s.strip_prefix('l').or_else(|| s.strip_prefix('L')) {
+            let idx: usize = idx_str.parse()
+                .map_err(|_| format!("Invalid line index '{}' in source '{}'", idx_str, s))?;
+            Ok(FieldSource::Line(idx))
+        } else if let Some(idx_str) = s.strip_prefix('p').or_else(|| s.strip_prefix('P')) {
+            let idx: usize = idx_str.parse()
+                .map_err(|_| format!("Invalid path index '{}' in source '{}'", idx_str, s))?;
+            Ok(FieldSource::Path(idx))
+        } else {
+            // Default to line source if just a number
+            let idx: usize = s.parse()
+                .map_err(|_| format!("Invalid source '{}': use l1, p1, or _ for count", s))?;
+            Ok(FieldSource::Line(idx))
+        }
+    }
+}
+
+/// Unified field specification for both DB and Map modes
+/// Syntax: source:name[:type[:op]]
+/// Examples:
+///   l1:userid           -> line capture 1, name "userid", type string, no op
+///   l1:userid:i         -> line capture 1, name "userid", type i64, no op
+///   l1:bytes:i:sum      -> line capture 1, name "bytes", type i64, sum aggregation
+///   _:rowcount:i:count  -> no source, name "rowcount", type i64, count aggregation
+#[derive(Clone, Debug)]
+pub struct FieldSpec {
+    pub source: FieldSource,
+    pub name: String,
+    pub dtype: DataType,
+    pub op: Option<AggOp>,
+}
+
+impl FieldSpec {
+    /// Parse a single field spec from "source:name[:type[:op]]"
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        let parts: Vec<&str> = s.split(':').collect();
+        if parts.len() < 2 {
+            return Err(format!("Invalid field spec '{}': need at least source:name", s));
+        }
+
+        let source = FieldSource::from_str(parts[0])?;
+        let name = parts[1].to_string();
+        
+        if name.is_empty() {
+            return Err(format!("Empty field name in spec '{}'", s));
+        }
+
+        let dtype = if parts.len() >= 3 && !parts[2].is_empty() {
+            DataType::from_str(parts[2])?
+        } else {
+            DataType::String
+        };
+
+        let op = if parts.len() >= 4 && !parts[3].is_empty() {
+            Some(AggOp::from_str(parts[3])?)
+        } else {
+            None
+        };
+
+        // Validate: count operation requires None source
+        if let Some(AggOp::Count) = op {
+            if source != FieldSource::None {
+                return Err(format!(
+                    "Count operation in '{}' should use '_' as source (e.g., '_:rowcount:i:count')", s
+                ));
+            }
+        }
+
+        // Validate: None source requires count operation
+        if source == FieldSource::None && op != Some(AggOp::Count) {
+            return Err(format!(
+                "Source '_' in '{}' is only valid with count operation", s
+            ));
+        }
+
+        Ok(FieldSpec { source, name, dtype, op })
+    }
+}
+
+/// Parse multiple field specs from semicolon-separated string
+pub fn parse_field_specs(s: &str) -> Result<Vec<FieldSpec>, String> {
+    // Remove all whitespace before parsing
+    let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    
+    let mut specs = Vec::new();
+    for part in s.split(';') {
+        if part.is_empty() {
+            continue;
+        }
+        specs.push(FieldSpec::from_str(part)?);
+    }
+    if specs.is_empty() {
+        return Err("No valid field specs found".to_string());
+    }
+    Ok(specs)
+}
+
+/// Validate field specs for DB mode (no aggregation ops allowed)
+pub fn validate_field_specs_for_db(specs: &[FieldSpec]) -> Result<(), String> {
+    for spec in specs {
+        if spec.op.is_some() {
+            return Err(format!(
+                "Field '{}' has aggregation operation which is not allowed in DB mode. \
+                Remove the operation or use 'map' subcommand for aggregation.",
+                spec.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate field specs for Map mode (at least one key required)
+pub fn validate_field_specs_for_map(specs: &[FieldSpec]) -> Result<(), String> {
+    let has_key = specs.iter().any(|s| s.op == Some(AggOp::Key));
+    if !has_key {
+        return Err(
+            "Map mode requires at least one key field (e.g., 'l1:name:s:key'). \
+            Add ':key' or ':k' to at least one field spec.".to_string()
+        );
+    }
+    Ok(())
+}
+
 #[derive(ValueEnum, Clone, Copy, Debug)]
 pub enum OutFormat {
     Tsv,
@@ -93,8 +287,12 @@ pub struct Cli {
     #[arg(long = "no-recursive", help_heading = "Parsing")]
     pub no_recursive: bool,
 
-    /// Field mapping (e.g., "p1:host;l1:date"). Prefixes: 'p' for path, 'l' for line.
-    #[arg(short = 'F', long = "fields", help_heading = "Parsing", verbatim_doc_comment)]
+    /// Field mapping: source:name[:type[:op]] separated by semicolons.
+    /// Sources: l1,l2 (line captures), p1,p2 (path captures), _ (for count).
+    /// Types: s/string (default), i/int, f/float.
+    /// Ops (map mode only): k/key, sum, a/avg, c/count, x/max, n/min.
+    /// Examples: "l1:host:s;l2:bytes:i" or "l1:host:s:key;l2:bytes:i:sum"
+    #[arg(short = 'm', long = "map", help_heading = "Parsing", verbatim_doc_comment)]
     pub field_map: Option<String>,
 
     // --- Error Handling ---
@@ -227,13 +425,6 @@ impl DbOptions {
 
 #[derive(Args, Debug)]
 pub struct MapOptions {
-    /// Aggregation map definition (e.g. "1_k_i;2_k_s;5_s_i").
-    /// Format: index_role_type separated by ;.
-    /// Roles: k=Key, s=Sum, c=Count, x=Max, n=Min, a=Avg.
-    /// Types: i=i64, u=u64, f=f64, s=String.
-    #[arg(short = 'm', long = "map", help_heading = "Aggregation", verbatim_doc_comment)]
-    pub map_def: String,
-
     /// Number of mapper threads to use for aggregation
     #[arg(long = "map-threads", help_heading = "Performance")]
     pub map_threads: Option<usize>,

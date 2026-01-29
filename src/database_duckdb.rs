@@ -18,7 +18,7 @@ use crate::output::{fmt_float, make_sink, OutputConfig};
 #[cfg(feature = "duckdb")]
 use crate::stats::{get_iso_time, DbStats, RunMetadata};
 #[cfg(feature = "duckdb")]
-use crate::database::split_sql_statements;
+use crate::database::{split_sql_statements, ColumnDef, TypedValue};
 
 #[cfg(feature = "duckdb")]
 use duckdb::{params, types::ValueRef, Connection};
@@ -35,7 +35,7 @@ pub fn run_db_worker_duckdb(
     rx: Receiver<crate::database::DbRecord>,
     batch_size: usize,
     track_matches: bool,
-    columns: Vec<String>,
+    columns: Vec<ColumnDef>,
     stats: Arc<DbStats>,
     splicer_stats: Arc<SplicerStats>,
     meta: RunMetadata,
@@ -107,9 +107,10 @@ pub fn run_db_worker_duckdb(
         conn.execute(&format!("CREATE TABLE {} (id BIGINT PRIMARY KEY, file_id BIGINT, \"offset\" BIGINT, content TEXT)", matches_table_name), [])?;
     }
 
+    // Build typed column definitions
     let mut col_defs = String::new();
     for col in &columns {
-        col_defs.push_str(&format!(", \"{}\" TEXT", col));
+        col_defs.push_str(&format!(", \"{}\" {}", col.name, col.dtype.sql_type()));
     }
     let match_id_col = if track_matches {
         ", match_id BIGINT"
@@ -202,7 +203,7 @@ fn flush_batch_duckdb(
     batch: &mut Vec<crate::database::DbRecord>,
     file_cache: &mut HashMap<PathBuf, i64>,
     track_matches: bool,
-    _columns: &[String],
+    _columns: &[ColumnDef],
     stats: &Arc<DbStats>,
     run_id: i64,
     data_table_name: &str,
@@ -290,20 +291,58 @@ fn flush_batch_duckdb(
         }
 
         // Append data row with explicit id and dynamic fields
+        // We need to convert TypedValue to owned values for the appender
         data_id += 1;
+        
+        // Convert TypedValue fields to bindable values
+        // We store owned values to ensure they live long enough
+        let mut string_values: Vec<String> = Vec::with_capacity(fields.len());
+        let mut i64_values: Vec<i64> = Vec::with_capacity(fields.len());
+        let mut f64_values: Vec<f64> = Vec::with_capacity(fields.len());
+        let mut null_string_values: Vec<Option<String>> = Vec::with_capacity(fields.len());
+        
+        for field in &fields {
+            match field {
+                TypedValue::Null => {
+                    null_string_values.push(None);
+                    string_values.push(String::new());
+                    i64_values.push(0);
+                    f64_values.push(0.0);
+                }
+                TypedValue::String(s) => {
+                    null_string_values.push(Some(String::new())); // placeholder
+                    string_values.push(s.clone());
+                    i64_values.push(0);
+                    f64_values.push(0.0);
+                }
+                TypedValue::I64(v) => {
+                    null_string_values.push(Some(String::new())); // placeholder
+                    string_values.push(String::new());
+                    i64_values.push(*v);
+                    f64_values.push(0.0);
+                }
+                TypedValue::F64(v) => {
+                    null_string_values.push(Some(String::new())); // placeholder
+                    string_values.push(String::new());
+                    i64_values.push(0);
+                    f64_values.push(*v);
+                }
+            }
+        }
+
         if track_matches {
             let mut row_data: Vec<&dyn duckdb::ToSql> = Vec::with_capacity(4 + fields.len());
             row_data.push(&data_id);
             row_data.push(&run_id);
             row_data.push(&file_id);
-            // safe unwrap as we only come here when tracking
             let mid = current_match_id.unwrap();
             row_data.push(&mid);
-            for field in &fields {
-                if let Some(s) = field {
-                    row_data.push(s);
-                } else {
-                    row_data.push(&"");
+            for (i, field) in fields.iter().enumerate() {
+                match field {
+                    TypedValue::Null => row_data.push(&null_string_values[i]),
+                    TypedValue::String(_) => row_data.push(&string_values[i]),
+                    TypedValue::I64(_) => row_data.push(&i64_values[i]),
+                    TypedValue::F64(_) => row_data.push(&f64_values[i]),
                 }
             }
             data_appender.append_row(row_data.as_slice())?;
@@ -312,11 +351,12 @@ fn flush_batch_duckdb(
             row_data.push(&data_id);
             row_data.push(&run_id);
             row_data.push(&file_id);
-            for field in &fields {
-                if let Some(s) = field {
-                    row_data.push(s);
-                } else {
-                    row_data.push(&"");
+            for (i, field) in fields.iter().enumerate() {
+                match field {
+                    TypedValue::Null => row_data.push(&null_string_values[i]),
+                    TypedValue::String(_) => row_data.push(&string_values[i]),
+                    TypedValue::I64(_) => row_data.push(&i64_values[i]),
+                    TypedValue::F64(_) => row_data.push(&f64_values[i]),
                 }
             }
             data_appender.append_row(row_data.as_slice())?;
@@ -364,13 +404,15 @@ fn execute_and_print_sql_duckdb(
                 .context(format!("Failed to prepare SQL: {}", clean_sql))?;
 
             writeln!(writer, "> Query: {}", clean_sql)?;
-            // Collect rows first to avoid borrowing `writer` during iteration
+            
+            // Execute query and collect rows
             let mut rows = stmt.query([])?;
             let mut rows_buf: Vec<Vec<String>> = Vec::new();
             let mut col_count: usize = 0;
+            
             while let Some(row) = rows.next()? {
+                // Get column count from first row by probing
                 if col_count == 0 {
-                    // Determine column count using first row
                     let mut i = 0;
                     loop {
                         match row.get_ref(i) {
@@ -380,6 +422,7 @@ fn execute_and_print_sql_duckdb(
                     }
                     col_count = i;
                 }
+                
                 let mut values: Vec<String> = Vec::with_capacity(col_count);
                 for i in 0..col_count {
                     let s = match row.get_ref(i).unwrap() {
@@ -394,7 +437,13 @@ fn execute_and_print_sql_duckdb(
                 rows_buf.push(values);
             }
             let row_count = rows_buf.len();
-            let col_names: Vec<String> = (0..col_count).map(|j| format!("col{}", j + 1)).collect();
+            
+            // Get column names from the statement after rows iteration is complete
+            let col_names: Vec<String> = (0..col_count)
+                .map(|j| stmt.column_name(j)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|_| format!("col{}", j + 1)))
+                .collect();
             {
                 let mut sink = make_sink(*out_cfg, writer)?;
                 sink.write_header(&col_names)?;

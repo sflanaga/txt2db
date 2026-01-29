@@ -15,6 +15,7 @@ pub enum AggRole {
 }
 
 #[derive(Clone, Debug, PartialEq, Copy)]
+#[allow(dead_code)]
 pub enum AggType {
     I64,
     U64,
@@ -265,6 +266,7 @@ impl AggAccumulator {
     }
 }
 
+#[allow(dead_code)]
 pub fn parse_map_def(def: &str) -> Result<Vec<MapFieldSpec>> {
     let mut specs = Vec::new();
     for part in def.split(';') {

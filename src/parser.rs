@@ -6,8 +6,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::aggregation::{AggAccumulator, AggRole, AggValue, AggFieldSource, MapFieldSpec};
-use crate::config::DisableConfig;
-use crate::database::{ColumnDef, DbRecord, FieldSource as DbFieldSource};
+use crate::config::{DisableConfig, FieldSource as ConfigFieldSource};
+use crate::database::{ColumnDef, DbRecord, TypedValue};
 use crate::io_splicer::SplicedChunk;
 use crate::stats::DbStats;
 
@@ -412,11 +412,13 @@ pub fn run_db_parser(
     path_re: Option<Regex>,
     columns: Vec<ColumnDef>,
     stats: Arc<DbStats>,
+    show_errors: bool,
+    stop_on_error: bool,
 ) {
     match line_re {
-        AnyRegex::Std(re) => run_db_parser_std(rx, recycle_tx, db_tx, re, path_re, columns, stats),
+        AnyRegex::Std(re) => run_db_parser_std(rx, recycle_tx, db_tx, re, path_re, columns, stats, show_errors, stop_on_error),
         AnyRegex::Pcre(re) => {
-            run_db_parser_pcre(rx, recycle_tx, db_tx, re, path_re, columns, stats)
+            run_db_parser_pcre(rx, recycle_tx, db_tx, re, path_re, columns, stats, show_errors, stop_on_error)
         }
     }
 }
@@ -429,8 +431,19 @@ fn run_db_parser_std(
     path_re: Option<Regex>,
     columns: Vec<ColumnDef>,
     stats: Arc<DbStats>,
+    show_errors: bool,
+    stop_on_error: bool,
 ) {
+    let mut should_stop = false;
+
     while let Ok(chunk) = rx.recv() {
+        if should_stop {
+            let mut data = chunk.data;
+            data.clear();
+            let _ = recycle_tx.send(data);
+            continue;
+        }
+
         let mut data = chunk.data;
         stats
             .bytes_processed
@@ -440,14 +453,14 @@ fn run_db_parser_std(
         let chunk_offset = chunk.offset;
 
         let mut should_process = true;
-        let mut path_fields = Vec::with_capacity(columns.len());
+        let mut path_fields: Vec<(usize, String)> = Vec::with_capacity(columns.len());
 
         if let Some(pre) = &path_re {
             if let Some(p) = &path_arc {
                 let p_norm = normalize_path_for_regex(p.as_path());
                 if let Some(caps) = pre.captures(&p_norm) {
                     for col in &columns {
-                        if let DbFieldSource::Path(idx) = col.source {
+                        if let ConfigFieldSource::Path(idx) = col.source {
                             let val = caps
                                 .get(idx)
                                 .map(|m| m.as_str().to_string())
@@ -465,6 +478,11 @@ fn run_db_parser_std(
 
         if should_process {
             let s = String::from_utf8_lossy(&data);
+
+            let path_display = path_arc
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "stdin".to_string());
 
             for capture in line_re.captures_iter(&s) {
                 stats.matched_lines.fetch_add(1, Ordering::Relaxed);
@@ -490,20 +508,53 @@ fn run_db_parser_std(
                 let match_offset = chunk_offset + start_idx as u64;
 
                 let mut fields = Vec::with_capacity(columns.len());
+                let mut row_has_error = false;
+
                 for col in &columns {
-                    match col.source {
-                        DbFieldSource::Line(idx) => {
-                            fields.push(capture.get(idx).map(|m| m.as_str().to_string()));
+                    let raw_str = match &col.source {
+                        ConfigFieldSource::Line(idx) => {
+                            capture.get(*idx).map(|m| m.as_str()).unwrap_or("")
                         }
-                        DbFieldSource::Path(idx) => {
-                            let val = path_fields
+                        ConfigFieldSource::Path(idx) => {
+                            path_fields
                                 .iter()
-                                .find(|(k, _)| *k == idx)
-                                .map(|(_, v)| v.clone());
-                            fields.push(val);
+                                .find(|(k, _)| k == idx)
+                                .map(|(_, v)| v.as_str())
+                                .unwrap_or("")
+                        }
+                        ConfigFieldSource::None => "",
+                    };
+
+                    match TypedValue::parse(raw_str, col.dtype) {
+                        Ok(val) => fields.push(val),
+                        Err(e) => {
+                            row_has_error = true;
+                            stats.total_errors.fetch_add(1, Ordering::Relaxed);
+                            if show_errors {
+                                eprintln!(
+                                    "Type error: {} at {}:{} field '{}'",
+                                    e, path_display, match_offset, col.name
+                                );
+                            }
+                            if stop_on_error {
+                                should_stop = true;
+                                break;
+                            }
+                            // Insert NULL on error and continue
+                            fields.push(TypedValue::Null);
                         }
                     }
                 }
+
+                if should_stop {
+                    break;
+                }
+
+                // Skip row if it had errors (already counted)
+                if row_has_error {
+                    continue;
+                }
+
                 let record = DbRecord::Data {
                     file_path: path_arc.clone(),
                     offset: match_offset,
@@ -528,8 +579,19 @@ fn run_db_parser_pcre(
     path_re: Option<Regex>,
     columns: Vec<ColumnDef>,
     stats: Arc<DbStats>,
+    show_errors: bool,
+    stop_on_error: bool,
 ) {
+    let mut should_stop = false;
+
     while let Ok(chunk) = rx.recv() {
+        if should_stop {
+            let mut data = chunk.data;
+            data.clear();
+            let _ = recycle_tx.send(data);
+            continue;
+        }
+
         let mut data = chunk.data;
         stats
             .bytes_processed
@@ -539,14 +601,14 @@ fn run_db_parser_pcre(
         let chunk_offset = chunk.offset;
 
         let mut should_process = true;
-        let mut path_fields = Vec::with_capacity(columns.len());
+        let mut path_fields: Vec<(usize, String)> = Vec::with_capacity(columns.len());
 
         if let Some(pre) = &path_re {
             if let Some(p) = &path_arc {
                 let p_norm = normalize_path_for_regex(p.as_path());
                 if let Some(caps) = pre.captures(&p_norm) {
                     for col in &columns {
-                        if let DbFieldSource::Path(idx) = col.source {
+                        if let ConfigFieldSource::Path(idx) = col.source {
                             let val = caps
                                 .get(idx)
                                 .map(|m| m.as_str().to_string())
@@ -563,6 +625,11 @@ fn run_db_parser_pcre(
         }
 
         if should_process {
+            let path_display = path_arc
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "stdin".to_string());
+
             // PCRE2 Iteration
             for result in line_re.captures_iter(&data) {
                 if let Ok(capture) = result {
@@ -591,23 +658,56 @@ fn run_db_parser_pcre(
                     let match_offset = chunk_offset + start_idx as u64;
 
                     let mut fields = Vec::with_capacity(columns.len());
+                    let mut row_has_error = false;
+
                     for col in &columns {
-                        match col.source {
-                            DbFieldSource::Line(idx) => {
-                                let val = capture
-                                    .get(idx)
-                                    .map(|m| String::from_utf8_lossy(m.as_bytes()).to_string());
-                                fields.push(val);
+                        let raw_str = match &col.source {
+                            ConfigFieldSource::Line(idx) => {
+                                capture
+                                    .get(*idx)
+                                    .map(|m| String::from_utf8_lossy(m.as_bytes()).to_string())
+                                    .unwrap_or_default()
                             }
-                            DbFieldSource::Path(idx) => {
-                                let val = path_fields
+                            ConfigFieldSource::Path(idx) => {
+                                path_fields
                                     .iter()
-                                    .find(|(k, _)| *k == idx)
-                                    .map(|(_, v)| v.clone());
-                                fields.push(val);
+                                    .find(|(k, _)| k == idx)
+                                    .map(|(_, v)| v.clone())
+                                    .unwrap_or_default()
+                            }
+                            ConfigFieldSource::None => String::new(),
+                        };
+
+                        match TypedValue::parse(&raw_str, col.dtype) {
+                            Ok(val) => fields.push(val),
+                            Err(e) => {
+                                row_has_error = true;
+                                stats.total_errors.fetch_add(1, Ordering::Relaxed);
+                                if show_errors {
+                                    eprintln!(
+                                        "Type error: {} at {}:{} field '{}'",
+                                        e, path_display, match_offset, col.name
+                                    );
+                                }
+                                if stop_on_error {
+                                    should_stop = true;
+                                    break;
+                                }
+                                // Insert NULL on error and continue
+                                fields.push(TypedValue::Null);
                             }
                         }
                     }
+
+                    if should_stop {
+                        break;
+                    }
+
+                    // Skip row if it had errors
+                    if row_has_error {
+                        continue;
+                    }
+
                     let record = DbRecord::Data {
                         file_path: path_arc.clone(),
                         offset: match_offset,

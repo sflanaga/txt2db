@@ -18,7 +18,7 @@ use crate::output::{fmt_float, make_sink, OutputConfig};
 #[cfg(feature = "sqlite")]
 use crate::stats::{get_iso_time, DbStats, RunMetadata};
 #[cfg(feature = "sqlite")]
-use crate::database::split_sql_statements;
+use crate::database::{split_sql_statements, ColumnDef, TypedValue};
 
 #[cfg(feature = "sqlite")]
 use rusqlite::{params, types::ValueRef, Connection};
@@ -59,7 +59,7 @@ pub fn run_db_worker_sqlite(
     rx: Receiver<crate::database::DbRecord>,
     batch_size: usize,
     track_matches: bool,
-    columns: Vec<String>,
+    columns: Vec<ColumnDef>,
     stats: Arc<DbStats>,
     splicer_stats: Arc<SplicerStats>,
     meta: RunMetadata,
@@ -126,9 +126,15 @@ pub fn run_db_worker_sqlite(
         conn.execute(&format!("CREATE TABLE {} (id INTEGER PRIMARY KEY, file_id INTEGER, offset INTEGER, content TEXT)", matches_table_name), [])?;
     }
 
+    // Build typed column definitions (SQLite uses REAL instead of DOUBLE)
     let mut col_defs = String::new();
     for col in &columns {
-        col_defs.push_str(&format!(", {} TEXT", col));
+        let sql_type = match col.dtype {
+            crate::config::DataType::String => "TEXT",
+            crate::config::DataType::I64 => "INTEGER",
+            crate::config::DataType::F64 => "REAL",
+        };
+        col_defs.push_str(&format!(", \"{}\" {}", col.name, sql_type));
     }
     let match_id_col = if track_matches {
         ", match_id INTEGER"
@@ -288,13 +294,16 @@ fn flush_batch_sqlite(
     batch: &mut Vec<crate::database::DbRecord>,
     file_cache: &mut HashMap<PathBuf, i64>,
     track_matches: bool,
-    columns: &[String],
+    columns: &[ColumnDef],
     stats: &Arc<DbStats>,
     data_table: &str,
     matches_table: &str,
     run_id: i64,
 ) -> Result<()> {
     let tx = conn.transaction()?;
+
+    // Build column names string once
+    let col_names: String = columns.iter().map(|c| format!("\"{}\"", c.name)).collect::<Vec<_>>().join(", ");
 
     for record in batch.drain(..) {
         let crate::database::DbRecord::Data {
@@ -333,35 +342,77 @@ fn flush_batch_sqlite(
             current_match_id = Some(tx.last_insert_rowid());
         }
 
-        let mut place_holders = String::new();
-        let mut values: Vec<String> = Vec::new();
+        // Build placeholders for typed values
+        let field_placeholders: String = (0..fields.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+        
+        let match_col = if track_matches { "match_id, " } else { "" };
+        let match_placeholder = if track_matches { "?, " } else { "" };
+        
+        let sql = format!(
+            "INSERT INTO {} (run_id, file_id, {}{}) VALUES (?, ?, {}{})",
+            data_table, match_col, col_names, match_placeholder, field_placeholders
+        );
 
-        place_holders.push_str("?, ?, ");
-        values.push(run_id.to_string());
-        values.push(file_id.to_string());
+        // Build params dynamically based on TypedValue types
+        // We need to collect owned values first
+        let mut string_vals: Vec<String> = Vec::new();
+        let mut i64_vals: Vec<i64> = Vec::new();
+        let mut f64_vals: Vec<f64> = Vec::new();
+        
+        for field in &fields {
+            match field {
+                TypedValue::Null => {
+                    string_vals.push(String::new());
+                    i64_vals.push(0);
+                    f64_vals.push(0.0);
+                }
+                TypedValue::String(s) => {
+                    string_vals.push(s.clone());
+                    i64_vals.push(0);
+                    f64_vals.push(0.0);
+                }
+                TypedValue::I64(v) => {
+                    string_vals.push(String::new());
+                    i64_vals.push(*v);
+                    f64_vals.push(0.0);
+                }
+                TypedValue::F64(v) => {
+                    string_vals.push(String::new());
+                    i64_vals.push(0);
+                    f64_vals.push(*v);
+                }
+            }
+        }
 
+        // Build the params vector
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        params_vec.push(Box::new(run_id));
+        params_vec.push(Box::new(file_id));
+        
         if track_matches {
-            place_holders.push_str("?, ");
-            values.push(current_match_id.unwrap().to_string());
+            params_vec.push(Box::new(current_match_id.unwrap()));
         }
 
         for (i, field) in fields.iter().enumerate() {
-            if i > 0 {
-                place_holders.push_str(", ");
+            match field {
+                TypedValue::Null => {
+                    let null_val: Option<String> = None;
+                    params_vec.push(Box::new(null_val));
+                }
+                TypedValue::String(_) => {
+                    params_vec.push(Box::new(string_vals[i].clone()));
+                }
+                TypedValue::I64(_) => {
+                    params_vec.push(Box::new(i64_vals[i]));
+                }
+                TypedValue::F64(_) => {
+                    params_vec.push(Box::new(f64_vals[i]));
+                }
             }
-            place_holders.push_str("?");
-            values.push(field.clone().unwrap_or_default());
         }
 
-        let match_col = if track_matches { "match_id, " } else { "" };
-        let col_names = columns.join(", ");
-        let sql = format!(
-            "INSERT INTO {} (run_id, file_id, {}{}) VALUES ({})",
-            data_table, match_col, col_names, place_holders
-        );
-        let params_refs: Vec<&dyn rusqlite::ToSql> =
-            values.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-        tx.execute(&sql, &*params_refs)?;
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+        tx.execute(&sql, params_refs.as_slice())?;
 
         stats.committed_records.fetch_add(1, Ordering::Relaxed);
     }

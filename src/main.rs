@@ -24,9 +24,9 @@ mod output;
 mod parser;
 mod stats;
 
-use crate::aggregation::{parse_map_def, render_map_results, AggAccumulator, AggValue};
+use crate::aggregation::{render_map_results, AggAccumulator, AggValue};
 use crate::config::{Cli, DisableConfig, OutFormat};
-use crate::database::{run_db_worker, ColumnDef, DbRecord, FieldSource};
+use crate::database::{run_db_worker, ColumnDef, DbRecord};
 use crate::io_splicer::{IoSplicer, SplicedChunk, SplicerConfig, SplicerStats};
 use crate::output::{OutputConfig, OutputFormat};
 use crate::parser::{run_db_parser, run_mapper_worker, AnyRegex};
@@ -42,14 +42,17 @@ fn main() -> Result<()> {
     let command_line = raw_args.join(" ");
     let cli = Cli::parse();
 
+    // Determine if we're in map mode or db mode
+    let is_map_mode = matches!(cli.command, crate::config::Command::Map(_));
+
     // Extract mode-specific options from subcommand
-    let (map_def, map_threads, db_path, db_backend, track_matches, batch_size, db_channel_size, cache_mb, duckdb_threads, duckdb_memory_limit, parser_threads, pre_sql, post_sql, pre_sql_file, post_sql_file) = match &cli.command {
+    let (map_threads, db_path, db_backend, track_matches, batch_size, db_channel_size, cache_mb, duckdb_threads, duckdb_memory_limit, parser_threads, pre_sql, post_sql, pre_sql_file, post_sql_file): (Option<usize>, Option<String>, crate::config::DbBackend, bool, usize, usize, i64, usize, String, Option<usize>, Option<String>, Option<String>, Option<std::path::PathBuf>, Option<std::path::PathBuf>) = match &cli.command {
         crate::config::Command::Db(opts) => {
             opts.validate();
-            (None, None, opts.db_path.clone(), opts.db_backend, opts.track_matches, opts.batch_size, opts.db_channel_size, opts.cache_mb, opts.duckdb_threads, opts.duckdb_memory_limit.clone(), opts.parser_threads, opts.pre_sql.clone(), opts.post_sql.clone(), opts.pre_sql_file.clone(), opts.post_sql_file.clone())
+            (None, opts.db_path.clone(), opts.db_backend, opts.track_matches, opts.batch_size, opts.db_channel_size, opts.cache_mb, opts.duckdb_threads, opts.duckdb_memory_limit.clone(), opts.parser_threads, opts.pre_sql.clone(), opts.post_sql.clone(), opts.pre_sql_file.clone(), opts.post_sql_file.clone())
         }
         crate::config::Command::Map(opts) => {
-            (Some(opts.map_def.clone()), opts.map_threads, None, crate::config::DbBackend::Sqlite, false, 1000, 65536, 100, 8, "1GB".to_string(), None, None, None, None, None)
+            (opts.map_threads, None, crate::config::DbBackend::Sqlite, false, 1000, 65536, 100, 8, "1GB".to_string(), None, None, None, None, None)
         }
     };
 
@@ -117,100 +120,127 @@ fn main() -> Result<()> {
         None
     };
 
-    // Setup Map Specs
-    let map_specs = if let Some(def) = &map_def {
-        Some(parse_map_def(def).context(format!("Invalid map definition (--map): '{}'", def))?)
+    // Parse field specs from -m option if provided
+    let field_specs = if let Some(map_str) = &cli.field_map {
+        let specs = crate::config::parse_field_specs(map_str)
+            .map_err(|e| anyhow::anyhow!("Invalid field spec (-m): {}", e))?;
+        
+        // Validate based on mode
+        if is_map_mode {
+            crate::config::validate_field_specs_for_map(&specs)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+        } else {
+            // DB mode: ensure no aggregation ops
+            for spec in &specs {
+                if spec.op.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "Aggregation operations (key, sum, avg, etc.) are not allowed in DB mode. \
+                        Remove the operation from field spec '{}'", spec.name
+                    ));
+                }
+            }
+        }
+        Some(specs)
     } else {
         None
     };
 
-    // Setup Columns
-    let mut columns = Vec::new();
-    if let Some(map_str) = &cli.field_map {
-        for part in map_str.split(';') {
-            let kv: Vec<&str> = part.split(':').collect();
-            if kv.len() == 2 {
-                let key = kv[0].trim();
-                let name = kv[1].to_string();
-                if let Some(idx_str) = key.strip_prefix('p') {
-                    let idx: usize = idx_str.trim().parse().map_err(|e| {
-                        anyhow::anyhow!(
-                            "Invalid path index '{}' in --fields part '{}': {}",
-                            idx_str,
-                            part,
-                            e
-                        )
-                    })?;
-                    columns.push(ColumnDef {
-                        name,
-                        source: FieldSource::Path(idx),
-                    });
-                } else if let Some(idx_str) = key.strip_prefix('l') {
-                    let idx: usize = idx_str.trim().parse().map_err(|e| {
-                        anyhow::anyhow!(
-                            "Invalid line index '{}' in --fields part '{}': {}",
-                            idx_str,
-                            part,
-                            e
-                        )
-                    })?;
-                    columns.push(ColumnDef {
-                        name,
-                        source: FieldSource::Line(idx),
-                    });
-                } else {
-                    let idx: usize = key.trim().parse().map_err(|e| {
-                        anyhow::anyhow!(
-                            "Invalid index '{}' in --fields part '{}': {}",
-                            key,
-                            part,
-                            e
-                        )
-                    })?;
-                    columns.push(ColumnDef {
-                        name,
-                        source: FieldSource::Line(idx),
-                    });
-                }
+    // Setup Map Specs (for backward compatibility with old map mode)
+    let map_specs = if is_map_mode && field_specs.is_none() {
+        // Legacy: if no -m provided in map mode, this would fail
+        // For now, require -m in map mode
+        return Err(anyhow::anyhow!("Map mode requires -m field specifications"));
+    } else if is_map_mode {
+        // Convert field_specs to MapFieldSpec for aggregation
+        let specs = field_specs.as_ref().unwrap();
+        Some(specs.iter().map(|fs| {
+            let (source, capture_index) = match fs.source {
+                crate::config::FieldSource::Line(idx) => (crate::aggregation::AggFieldSource::Line, idx),
+                crate::config::FieldSource::Path(idx) => (crate::aggregation::AggFieldSource::Path, idx),
+                crate::config::FieldSource::None => (crate::aggregation::AggFieldSource::Line, 0), // count case
+            };
+            let role = match fs.op {
+                Some(crate::config::AggOp::Key) => crate::aggregation::AggRole::Key,
+                Some(crate::config::AggOp::Sum) => crate::aggregation::AggRole::Sum,
+                Some(crate::config::AggOp::Avg) => crate::aggregation::AggRole::Avg,
+                Some(crate::config::AggOp::Count) => crate::aggregation::AggRole::Count,
+                Some(crate::config::AggOp::Max) => crate::aggregation::AggRole::Max,
+                Some(crate::config::AggOp::Min) => crate::aggregation::AggRole::Min,
+                None => crate::aggregation::AggRole::Key, // default to key if no op
+            };
+            let dtype = match fs.dtype {
+                crate::config::DataType::String => crate::aggregation::AggType::Str,
+                crate::config::DataType::I64 => crate::aggregation::AggType::I64,
+                crate::config::DataType::F64 => crate::aggregation::AggType::F64,
+            };
+            crate::aggregation::MapFieldSpec {
+                capture_index,
+                role,
+                dtype,
+                source,
+                name: Some(fs.name.clone()),
             }
-        }
+        }).collect::<Vec<_>>())
     } else {
-        if let Some(pre) = &path_re {
-            for i in 1..pre.captures_len() {
+        None
+    };
+
+    // Setup Columns for DB mode
+    let mut columns: Vec<ColumnDef> = Vec::new();
+    if !is_map_mode {
+        if let Some(specs) = &field_specs {
+            // Use parsed field specs
+            for fs in specs {
                 columns.push(ColumnDef {
-                    name: format!("pf_{}", i),
-                    source: FieldSource::Path(i),
-                });
-            }
-            for i in 1..line_re.captures_len() {
-                columns.push(ColumnDef {
-                    name: format!("lf_{}", i),
-                    source: FieldSource::Line(i),
-                });
-            }
-            if line_re.captures_len() == 1
-                && columns
-                    .iter()
-                    .all(|c| matches!(c.source, FieldSource::Path(_)))
-            {
-                columns.push(ColumnDef {
-                    name: "lf_0".to_string(),
-                    source: FieldSource::Line(0),
+                    name: fs.name.clone(),
+                    source: fs.source.clone(),
+                    dtype: fs.dtype,
                 });
             }
         } else {
-            let cap_len = line_re.captures_len();
-            for i in 1..cap_len {
-                columns.push(ColumnDef {
-                    name: format!("f_{}", i),
-                    source: FieldSource::Line(i),
-                });
-            }
-            if columns.is_empty() {
-                columns.push(ColumnDef {
-                    name: "f_0".to_string(),
-                    source: FieldSource::Line(0),
-                });
+            // Auto-generate columns from regex captures
+            if let Some(pre) = &path_re {
+                for i in 1..pre.captures_len() {
+                    columns.push(ColumnDef {
+                        name: format!("pf_{}", i),
+                        source: crate::config::FieldSource::Path(i),
+                        dtype: crate::config::DataType::String,
+                    });
+                }
+                for i in 1..line_re.captures_len() {
+                    columns.push(ColumnDef {
+                        name: format!("lf_{}", i),
+                        source: crate::config::FieldSource::Line(i),
+                        dtype: crate::config::DataType::String,
+                    });
+                }
+                if line_re.captures_len() == 1
+                    && columns
+                        .iter()
+                        .all(|c| matches!(c.source, crate::config::FieldSource::Path(_)))
+                {
+                    columns.push(ColumnDef {
+                        name: "lf_0".to_string(),
+                        source: crate::config::FieldSource::Line(0),
+                        dtype: crate::config::DataType::String,
+                    });
+                }
+            } else {
+                let cap_len = line_re.captures_len();
+                for i in 1..cap_len {
+                    columns.push(ColumnDef {
+                        name: format!("f_{}", i),
+                        source: crate::config::FieldSource::Line(i),
+                        dtype: crate::config::DataType::String,
+                    });
+                }
+                if columns.is_empty() {
+                    columns.push(ColumnDef {
+                        name: "f_0".to_string(),
+                        source: crate::config::FieldSource::Line(0),
+                        dtype: crate::config::DataType::String,
+                    });
+                }
             }
         }
     }
@@ -220,7 +250,7 @@ fn main() -> Result<()> {
         .unwrap_or(4);
 
     // Determine worker thread count first (parser or mapper depending on mode)
-    let worker_count = if map_def.is_some() {
+    let worker_count = if is_map_mode {
         // Map mode: use map_threads or default to half of cores
         map_threads.unwrap_or_else(|| std::cmp::max(1, total_cores / 2))
     } else {
@@ -275,7 +305,7 @@ fn main() -> Result<()> {
     let (db_tx, db_rx) = bounded::<DbRecord>(db_cap);
 
     // Determine if we're in DB mode for ticker display
-    let is_db_mode = map_def.is_none();
+    let is_db_mode = !is_map_mode;
 
     let start_time = Instant::now();
 
@@ -473,7 +503,7 @@ fn main() -> Result<()> {
         }
 
         // Spawn DB Worker
-        let col_defs_for_db = columns.iter().map(|c| c.name.clone()).collect();
+        let col_defs_for_db = columns.clone();
         let db_worker_stats = db_stats.clone();
         let db_splicer_stats = splicer_stats.clone();
         let out_cfg = output_cfg;
@@ -524,6 +554,8 @@ fn main() -> Result<()> {
                     thread_path_re,
                     thread_columns,
                     t_stats,
+                    true,  // show_errors
+                    false, // stop_on_error
                 )
             }));
         }
