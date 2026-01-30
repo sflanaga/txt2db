@@ -32,7 +32,7 @@ use crate::output::{OutputConfig, OutputFormat};
 use crate::parser::{run_db_parser, run_mapper_worker, AnyRegex};
 use crate::stats::{get_cpu_time_seconds, get_iso_time, DbStats, RunMetadata};
 
-const README: &str = include_str!("../README.md");
+const README: &str = include_str!("../Readme.md");
 
 fn normalize_cli_regex(s: &str) -> String {
     // Allow users to pass patterns with doubled backslashes (e.g., \\d, \\w) by collapsing them.

@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [profile.release]
+#opt-level = 3          # Standard "high" optimization (default for release)
+#lto = "fat"            # Maximize Link Time Optimization (cross-crate)
+#codegen-units = 1      # Disables parallel threads to allow better global optimization
+#panic = "abort"        # Removes stack unwinding code; smaller and slightly faster
 #debug = true  # Keeps symbols, but still optimizes fully
 
 [dependencies]
