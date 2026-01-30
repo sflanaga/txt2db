@@ -32,6 +32,8 @@ use crate::output::{OutputConfig, OutputFormat};
 use crate::parser::{run_db_parser, run_mapper_worker, AnyRegex};
 use crate::stats::{get_cpu_time_seconds, get_iso_time, DbStats, RunMetadata};
 
+const README: &str = include_str!("../README.md");
+
 fn normalize_cli_regex(s: &str) -> String {
     // Allow users to pass patterns with doubled backslashes (e.g., \\d, \\w) by collapsing them.
     s.replace(r"\\", r"\")
@@ -39,6 +41,25 @@ fn normalize_cli_regex(s: &str) -> String {
 
 fn main() -> Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
+    
+    // Handle --long-help before clap parsing (avoids subcommand requirement)
+    if raw_args.iter().any(|a| a == "--long-help") {
+        // Detect terminal width, cap at 120 for readability
+        let width = terminal_size::terminal_size()
+            .map(|(terminal_size::Width(w), _)| (w as usize).min(120))
+            .unwrap_or(80);
+        
+        // Render markdown to string with ANSI formatting
+        let skin = termimad::MadSkin::default();
+        let rendered = skin.text(README, Some(width)).to_string();
+        
+        // Display in pager
+        let pager = minus::Pager::new();
+        pager.set_text(&rendered).expect("Failed to set pager text");
+        minus::page_all(pager).expect("Failed to run pager");
+        return Ok(());
+    }
+    
     let command_line = raw_args.join(" ");
     let cli = Cli::parse();
 
@@ -130,15 +151,8 @@ fn main() -> Result<()> {
             crate::config::validate_field_specs_for_map(&specs)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
         } else {
-            // DB mode: ensure no aggregation ops
-            for spec in &specs {
-                if spec.op.is_some() {
-                    return Err(anyhow::anyhow!(
-                        "Aggregation operations (key, sum, avg, etc.) are not allowed in DB mode. \
-                        Remove the operation from field spec '{}'", spec.name
-                    ));
-                }
-            }
+            crate::config::validate_field_specs_for_db(&specs)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
         }
         Some(specs)
     } else {

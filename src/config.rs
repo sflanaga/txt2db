@@ -341,6 +341,10 @@ pub struct Cli {
     /// For TSV output: expand tabs for aligned columns
     #[arg(long = "expand-tabs", help_heading = "Output")]
     pub expand_tabs: bool,
+
+    /// Show detailed help with full documentation (renders README)
+    #[arg(long = "long-help", help_heading = "Help")]
+    pub long_help: bool,
 }
 
 #[derive(Subcommand, Debug)]
