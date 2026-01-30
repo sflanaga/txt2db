@@ -1,6 +1,37 @@
 use bytesize::ByteSize;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use log::{warn, error};
 use std::path::PathBuf;
+
+/// Expand @file arguments from command line args.
+/// Each @file is read line-by-line, with each non-empty, non-comment line becoming an argument.
+/// Multiple @files are supported and expanded in order.
+pub fn expand_args_from_files() -> Vec<String> {
+    let mut result = Vec::new();
+    for arg in std::env::args() {
+        if let Some(path) = arg.strip_prefix('@') {
+            // Read file, one argument per line (no shell-style parsing)
+            match std::fs::read_to_string(path) {
+                Ok(contents) => {
+                    for line in contents.lines() {
+                        let trimmed = line.trim();
+                        // Skip empty lines and comments
+                        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                            result.push(trimmed.to_string());
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Error reading args file '{}': {}", path, e);
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            result.push(arg);
+        }
+    }
+    result
+}
 
 /// Parse a size string with optional suffix, defaulting to bytes.
 /// Supports: B, K, KB, KiB, M, MB, MiB, G, GB, GiB, etc. (case-insensitive)
@@ -414,14 +445,14 @@ impl DbOptions {
     /// Validate backend-specific options
     pub fn validate(&self) {
         if matches!(self.db_backend, DbBackend::DuckDB) && self.cache_mb != 100 {
-            eprintln!("Warning: --cache-mb is SQLite-specific and has no effect with --db-backend duckdb");
+            warn!("--cache-mb is SQLite-specific and has no effect with --db-backend duckdb");
         }
         if matches!(self.db_backend, DbBackend::Sqlite) {
             if self.duckdb_threads != 8 {
-                eprintln!("Warning: --duckdb-threads is DuckDB-specific and has no effect with SQLite backend");
+                warn!("--duckdb-threads is DuckDB-specific and has no effect with SQLite backend");
             }
             if self.duckdb_memory_limit != "1GB" {
-                eprintln!("Warning: --duckdb-memory-limit is DuckDB-specific and has no effect with SQLite backend");
+                warn!("--duckdb-memory-limit is DuckDB-specific and has no effect with SQLite backend");
             }
         }
     }

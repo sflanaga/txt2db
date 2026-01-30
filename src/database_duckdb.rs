@@ -3,6 +3,8 @@ use anyhow::{Context, Result};
 #[cfg(feature = "duckdb")]
 use crossbeam_channel::Receiver;
 #[cfg(feature = "duckdb")]
+use log::{error, warn};
+#[cfg(feature = "duckdb")]
 use std::collections::HashMap;
 #[cfg(feature = "duckdb")]
 use std::io::Write;
@@ -53,7 +55,7 @@ pub fn run_db_worker_duckdb(
     if !meta.pre_sql.is_empty() {
         let mut stdout = std::io::stdout();
         if let Err(e) = execute_and_print_sql_duckdb(&conn, &meta.pre_sql, "PRE", &out_cfg, &mut stdout) {
-            eprintln!("PRE SQL error: {}", e);
+            error!("PRE SQL error: {}", e);
         }
     }
 
@@ -174,7 +176,7 @@ pub fn run_db_worker_duckdb(
     let _ = conn.execute("DROP VIEW IF EXISTS data", []);
     let create_view = format!("CREATE VIEW data AS SELECT * FROM {}", data_table_name);
     if let Err(e) = conn.execute(&create_view, []) {
-        eprintln!("Warning: Could not create 'data' view: {}", e);
+        warn!("Could not create 'data' view: {}", e);
     }
 
     if track_matches {
@@ -190,7 +192,7 @@ pub fn run_db_worker_duckdb(
     if !meta.post_sql.is_empty() {
         let mut stdout = std::io::stdout();
         if let Err(e) = execute_and_print_sql_duckdb(&conn, &meta.post_sql, "POST", &out_cfg, &mut stdout) {
-            eprintln!("POST SQL error: {}", e);
+            error!("POST SQL error: {}", e);
         }
     }
 

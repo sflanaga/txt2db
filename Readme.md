@@ -63,6 +63,54 @@ The `-m` option defines how capture groups map to named, typed columns:
 -m "p1:host:s:key;l1:bytes:i:sum"
 ```
 
+## Argument Files (@files)
+
+You can store command-line arguments in a file and reference it with `@filename`. This is useful for:
+- Saving complex regex patterns without shell escaping issues
+- Reusing common configurations
+- Keeping command lines manageable
+
+**Format:** One argument per line. Empty lines and lines starting with `#` are ignored.
+
+**Example file** (`scan.args`):
+```
+# Common scanning configuration
+--regex
+.*File commit timings: flush=(\d+)ms close=(\d+)ms.*
+--path-regex
+(.+)2026-01-(\d+)\.log
+-m
+p1:source:s:key;l1:flush:i:sum;l2:close:i:avg
+--ticker-verbose
+--out-format
+compact
+map
+/home/user/logs
+```
+
+**Usage:**
+```bash
+txt2db @scan.args
+```
+
+**Multiple files and overrides:**
+```bash
+# Load base config, then overrides, then additional CLI args
+txt2db @base.args @overrides.args --regex "different pattern" map ./other-dir
+```
+
+Arguments are processed in order — later arguments override earlier ones.
+
+**Notes:**
+- Do not use quotes around values (no shell processing)
+- Use full paths instead of `~` (tilde expansion is shell-specific)
+- The subcommand (`map` or `db`) and input paths go in the file too
+
+**Debugging:** Use `--debug-params` to see the expanded arguments:
+```bash
+txt2db @scan.args --debug-params
+```
+
 ---
 
 # Map Mode

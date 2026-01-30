@@ -526,17 +526,18 @@ fn test_map_mode_parse_error_counting() -> anyhow::Result<()> {
 
     let out = assert.get_output();
     let out_str = std::str::from_utf8(&out.stdout)?;
+    let err_str = std::str::from_utf8(&out.stderr)?;
 
     // Check Output (Only A should be present)
     assert!(out_str.contains("A\t10"));
     assert!(!out_str.contains("B\t"));
     assert!(!out_str.contains("C\t"));
 
-    // Check Stats for Parse Errors
-    assert!(out_str.contains("Parse Errors: 2"));
+    // Check Stats for Parse Errors (now in stderr via logger)
+    assert!(err_str.contains("Parse Errors: 2"), "Expected 'Parse Errors: 2' in stderr: {}", err_str);
 
-    // Check Specific Field Breakdown
-    assert!(out_str.contains("Capture Group 2: 2 errors"));
+    // Check Specific Field Breakdown (now in stderr via logger)
+    assert!(err_str.contains("Capture Group 2: 2 errors"), "Expected field breakdown in stderr: {}", err_str);
 
     Ok(())
 }
@@ -763,10 +764,11 @@ fn test_map_mode_path_capture_parse_error_counts() -> anyhow::Result<()> {
         .assert()
         .success();
 
-    let out_str = std::str::from_utf8(&assert.get_output().stdout)?;
-    // Should report one parse error for capture group 1 (path capture)
-    assert!(out_str.contains("Parse Errors: 1"));
-    assert!(out_str.contains("Capture Group 1: 1 errors"));
+    let out = assert.get_output();
+    let err_str = std::str::from_utf8(&out.stderr)?;
+    // Should report one parse error for capture group 1 (path capture) - now in stderr via logger
+    assert!(err_str.contains("Parse Errors: 1"), "Expected 'Parse Errors: 1' in stderr: {}", err_str);
+    assert!(err_str.contains("Capture Group 1: 1 errors"), "Expected field breakdown in stderr: {}", err_str);
     Ok(())
 }
 
@@ -1419,10 +1421,9 @@ fn test_extension_mismatch_warning() -> anyhow::Result<()> {
     let stderr = std::str::from_utf8(&output.stderr)?;
     let stdout = std::str::from_utf8(&output.stdout)?;
     
-    // Check both stderr and stdout for the warning
-    let warning = "Warning: Database file extension '.duckdb' does not match expected '.db' for sqlite";
-    assert!(stderr.contains(warning) || stdout.contains(warning), 
-            "Warning not found in stderr or stdout. stderr='{}', stdout='{}'", stderr, stdout);
+    // Check stderr for the warning (now logged via logger)
+    assert!(stderr.contains("does not match expected") && stderr.contains(".duckdb"), 
+            "Warning not found in stderr. stderr='{}'", stderr);
     
     Ok(())
 }
@@ -1457,10 +1458,11 @@ fn test_file_exists_warning() -> anyhow::Result<()> {
         .write_stdin("second line")
         .assert();
     
-    // Should contain warning about existing file
+    // Should contain warning about existing file (now logged via logger)
     let output = assert.get_output();
     let stderr = std::str::from_utf8(&output.stderr)?;
-    assert!(stderr.contains("Warning: Database file already exists. Appending to existing database."));
+    assert!(stderr.contains("already exists") || stderr.contains("Appending"),
+            "Warning not found in stderr. stderr='{}'", stderr);
     
     Ok(())
 }

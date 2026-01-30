@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::bounded;
+use log::{info, warn, debug, error};
 use regex::Regex;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
@@ -40,8 +41,23 @@ fn normalize_cli_regex(s: &str) -> String {
 }
 
 fn main() -> Result<()> {
-    let raw_args: Vec<String> = std::env::args().collect();
+    // Initialize logger with timestamps to stderr (early, before any logging)
+    env_logger::Builder::from_default_env()
+        .format_timestamp_millis()
+        .filter_level(log::LevelFilter::Info)
+        .init();
+
+    // Expand @file arguments (reads args from file, one arg per line)
+    let raw_args = crate::config::expand_args_from_files();
     
+    // Handle --debug-params before clap parsing (prints expanded args and exits)
+    if raw_args.iter().any(|a| a == "--debug-params") {
+        for (i, arg) in raw_args.iter().enumerate() {
+            eprintln!("[{}] {}", i, arg);
+        }
+        return Ok(());
+    }
+
     // Handle --long-help before clap parsing (avoids subcommand requirement)
     if raw_args.iter().any(|a| a == "--long-help") {
         // Detect terminal width, cap at 120 for readability
@@ -59,9 +75,9 @@ fn main() -> Result<()> {
         minus::page_all(pager).expect("Failed to run pager");
         return Ok(());
     }
-    
+
     let command_line = raw_args.join(" ");
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(&raw_args);
 
     // Determine if we're in map mode or db mode
     let is_map_mode = matches!(cli.command, crate::config::Command::Map(_));
@@ -80,12 +96,12 @@ fn main() -> Result<()> {
     // Parsing disable options
     let disable_ops = DisableConfig::from_str(cli.disable_operations.as_deref());
     if cli.disable_operations.is_some() {
-        println!("Performance Mode: Disabling operations: {:?}", disable_ops);
+        info!("Performance Mode: Disabling operations: {:?}", disable_ops);
     }
 
     // Output config
     if !matches!(cli.out_format, OutFormat::Tsv) && cli.expand_tabs {
-        eprintln!("Warning: --expand-tabs only applies to --out-format=tsv");
+        warn!("--expand-tabs only applies to --out-format=tsv");
     }
 
     let output_cfg = OutputConfig {
@@ -341,6 +357,7 @@ fn main() -> Result<()> {
         loop {
             thread::sleep(tick_duration);
             let files = mon_splicer.file_count.load(Ordering::Relaxed);
+            let queued = mon_splicer.paths_queued.load(Ordering::Relaxed);
             let skipped = mon_splicer.skipped_count.load(Ordering::Relaxed);
 
             // Show DB or Map count
@@ -381,28 +398,28 @@ fn main() -> Result<()> {
                 let errors = mon_db.total_errors.load(Ordering::Relaxed);
                 let display_matched_rate = matched_d as f64 * rate_factor;
 
-                println!(
-                    "Stats: [Files: {}/{} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Matched: {} ({:.0}/s)] [Processed: {} ({:.0}/s)]",
-                    files, skipped, display_files_rate, mb_total, display_mb_rate, matched, display_matched_rate, total_items, display_recs_rate
+                info!(
+                    "Stats: [Files: {}/{}q/{}s ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Matched: {} ({:.0}/s)] [Processed: {} ({:.0}/s)]",
+                    files, queued, skipped, display_files_rate, mb_total, display_mb_rate, matched, display_matched_rate, total_items, display_recs_rate
                 );
 
                 if is_db_mode {
                     let db_depth = mon_db_rx.len();
                     let db_pct = (db_depth as f64 / db_cap as f64 * 100.0) as usize;
-                    println!(
+                    info!(
                         "       [Chunks: {}] [Errors: {}] [Channels: splicer={}% recycle={}% db={}%] [RecycleMiss: {}]",
                         chunks, errors, splicer_pct, recycle_pct, db_pct, recycler_misses
                     );
                 } else {
-                    println!(
+                    info!(
                         "       [Chunks: {}] [Errors: {}] [Channels: splicer={}% recycle={}%] [RecycleMiss: {}]",
                         chunks, errors, splicer_pct, recycle_pct, recycler_misses
                     );
                 }
             } else {
-                println!(
-                    "Stats: [Files: {}/{} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Processed: {} ({:.0}/s)]",
-                    files, skipped, display_files_rate, mb_total, display_mb_rate, total_items, display_recs_rate
+                info!(
+                    "Stats: [Files: {}/{}q/{}s ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Processed: {} ({:.0}/s)]",
+                    files, queued, skipped, display_files_rate, mb_total, display_mb_rate, total_items, display_recs_rate
                 );
             }
         }
@@ -431,7 +448,7 @@ fn main() -> Result<()> {
         let map_thread_count = worker_count;
 
         // Pipeline info message
-        println!(
+        info!(
             "Pipeline: [Splicers: {}] --(splicer:{})-> [Mappers: {}] --(recycle:{})->"
             , splicer_count, splicer_cap, map_thread_count, recycle_cap
         );
@@ -480,7 +497,7 @@ fn main() -> Result<()> {
             };
             format!("scan_{:02}{:02}{:02}.{}", hour, minute, second, extension)
         });
-        println!("Database: {} ({})", db_filename, db_backend);
+        info!("Database: {} ({})", db_filename, db_backend);
 
         // Safety checks for database file
         let db_path = Path::new(&db_filename);
@@ -492,14 +509,14 @@ fn main() -> Result<()> {
                 crate::config::DbBackend::Sqlite => "db",
             };
             if ext != expected_ext && ext != "sqlite" && ext != "sqlite3" {
-                eprintln!("Warning: Database file extension '.{}' does not match expected '.{}' for {}", 
+                warn!("Database file extension '.{}' does not match expected '.{}' for {}", 
                     ext, expected_ext, db_backend);
             }
         }
         
         // Check if file already exists
         if db_path.exists() {
-            eprintln!("Warning: Database file already exists. Appending to existing database.");
+            warn!("Database file already exists. Appending to existing database.");
             
             // Validate it's the correct backend type
             if let Ok(mut file) = File::open(db_path) {
@@ -545,7 +562,7 @@ fn main() -> Result<()> {
         let parser_count = worker_count;
 
         // Pipeline info message
-        println!(
+        info!(
             "Pipeline: [Splicers: {}] --(splicer:{})-> [Parsers: {}] --(db:{})-> [DB Writer: 1] --(recycle:{})->",
             splicer_count, splicer_cap, parser_count, db_cap, recycle_cap
         );
@@ -584,6 +601,14 @@ fn main() -> Result<()> {
         let mut path_iterators: Vec<Box<dyn Iterator<Item = PathBuf> + Send>> = Vec::new();
 
         if !cli.inputs.is_empty() {
+            // Validate all input paths exist before starting processing
+            for path in &cli.inputs {
+                if !path.exists() {
+                    error!("Input path does not exist: {}", path.display());
+                    std::process::exit(1);
+                }
+            }
+            
             for path in cli.inputs {
                 if path.is_dir() {
                     let recursive = !cli.no_recursive;
@@ -624,7 +649,7 @@ fn main() -> Result<()> {
         }
 
         if path_iterators.is_empty() {
-            println!("No input sources provided. Defaulting to scanning current directory.");
+            info!("No input sources provided. Defaulting to scanning current directory.");
             let walker = WalkDir::new(".").max_depth(if cli.no_recursive { 1 } else { usize::MAX });
             let iter = walker
                 .into_iter()
@@ -658,13 +683,13 @@ fn main() -> Result<()> {
     // DB Finalization
     if let Some(h) = db_handle {
         let run_id = h.join().unwrap()?;
-        println!("Run ID: {}", run_id);
-        println!("Data Table: data_{}", run_id);
+        info!("Run ID: {}", run_id);
+        info!("Data Table: data_{}", run_id);
     }
 
     // Map Merging
     if !map_handles.is_empty() {
-        println!("Merging results from {} threads...", map_handles.len());
+        info!("Merging results from {} threads...", map_handles.len());
         let mut final_map: BTreeMap<Vec<AggValue>, Vec<AggAccumulator>> = BTreeMap::new();
 
         for h in map_handles {
@@ -686,7 +711,6 @@ fn main() -> Result<()> {
 
         let mut stdout = std::io::stdout();
         render_map_results(final_map, map_specs.unwrap(), &output_cfg, &mut stdout)?;
-        println!();
     }
 
     // Final Stats
@@ -712,25 +736,25 @@ fn main() -> Result<()> {
         String::new()
     };
 
-    println!(
+    info!(
         "Done:  [Files: {}/{} ({:.0}/s)] [Data: {:.1}MB ({:.1}MB/s)] [Matches: {}] [Processed: {} ({:.0}/s)] [Parse Errors: {}]{}",
         files, skipped, files_rate, mb_total, mb_rate, matches, total_recs, recs_rate, parse_errors, cpu_stats
     );
 
-    println!(
+    info!(
         "Timing: [Wall Time: {:.3}s] [CPU Time: {:.3}s]",
         duration, cpu_seconds
     );
     // Post-run warnings for empty results
     if files == 0 {
-        println!("Warning: No files matched filters/path-regex; nothing was processed.");
+        warn!("No files matched filters/path-regex; nothing was processed.");
     }
     if total_recs == 0 {
-        println!("Warning: No lines matched the regex; no output produced.");
+        warn!("No lines matched the regex; no output produced.");
     }
 
     if parse_errors > 0 {
-        println!("\n--- Parse Errors by Field Index ---");
+        warn!("--- Parse Errors by Field Index ---");
         // FIXED: Explicit type annotation for DashMap iterator
         let mut err_list: Vec<(usize, usize)> = db_stats
             .error_counts
@@ -739,7 +763,7 @@ fn main() -> Result<()> {
             .collect();
         err_list.sort_by_key(|k| k.0);
         for (idx, count) in err_list {
-            println!("Capture Group {}: {} errors", idx, count);
+            warn!("Capture Group {}: {} errors", idx, count);
         }
     }
 

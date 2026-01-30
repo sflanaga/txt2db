@@ -1,4 +1,5 @@
 use crossbeam_channel::{Receiver, Sender};
+use log::error;
 use pcre2::bytes::Regex as PcreRegex;
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap};
@@ -199,11 +200,11 @@ fn run_mapper_worker_std(
                         *stats.error_counts.entry(spec.capture_index).or_default() += 1;
 
                         if show_errors || stop_on_error {
-                            eprintln!("Parse Error at {}:{} (Capture Group {}): Failed to parse '{}' as {:?}", 
+                            error!("Parse Error at {}:{} (Capture Group {}): Failed to parse '{}' as {:?}", 
                                 path_display, abs_offset, spec.capture_index, raw, spec.dtype);
                         }
                         if stop_on_error {
-                            eprintln!("Stopping due to error (-E flag).");
+                            error!("Stopping due to error (-E flag).");
                             std::process::exit(1);
                         }
                     }
@@ -353,11 +354,11 @@ fn run_mapper_worker_pcre(
                             *stats.error_counts.entry(spec.capture_index).or_default() += 1;
 
                             if show_errors || stop_on_error {
-                                eprintln!("Parse Error at {}:{} (Capture Group {}): Failed to parse '{}' as {:?}", 
+                                error!("Parse Error at {}:{} (Capture Group {}): Failed to parse '{}' as {:?}", 
                                     path_display, abs_offset, spec.capture_index, raw, spec.dtype);
                             }
                             if stop_on_error {
-                                eprintln!("Stopping due to error (-E flag).");
+                                error!("Stopping due to error (-E flag).");
                                 std::process::exit(1);
                             }
                         }
@@ -531,7 +532,7 @@ fn run_db_parser_std(
                             row_has_error = true;
                             stats.total_errors.fetch_add(1, Ordering::Relaxed);
                             if show_errors {
-                                eprintln!(
+                                error!(
                                     "Type error: {} at {}:{} field '{}'",
                                     e, path_display, match_offset, col.name
                                 );
@@ -684,7 +685,7 @@ fn run_db_parser_pcre(
                                 row_has_error = true;
                                 stats.total_errors.fetch_add(1, Ordering::Relaxed);
                                 if show_errors {
-                                    eprintln!(
+                                    error!(
                                         "Type error: {} at {}:{} field '{}'",
                                         e, path_display, match_offset, col.name
                                     );

@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use bzip2::read::BzDecoder;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use flate2::read::GzDecoder;
+use log::error;
 use regex::Regex;
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -120,7 +121,7 @@ impl IoSplicer {
                     while let Ok(path) = rx.recv() {
                         self.stats.paths_queued.fetch_sub(1, Ordering::Relaxed);
                         if let Err(e) = self.process_file(&path) {
-                            eprintln!("Error processing {:?}: {}", path, e);
+                            error!("Error processing {:?}: {}", path, e);
                         }
                     }
                 });

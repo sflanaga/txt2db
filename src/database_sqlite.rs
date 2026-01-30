@@ -3,6 +3,8 @@ use anyhow::{Context, Result};
 #[cfg(feature = "sqlite")]
 use crossbeam_channel::Receiver;
 #[cfg(feature = "sqlite")]
+use log::warn;
+#[cfg(feature = "sqlite")]
 use std::collections::HashMap;
 #[cfg(feature = "sqlite")]
 use std::io::Write;
@@ -198,7 +200,7 @@ pub fn run_db_worker_sqlite(
     let _ = conn.execute("DROP VIEW IF EXISTS data", []);
     let create_view = format!("CREATE VIEW data AS SELECT * FROM {}", data_table_name);
     if let Err(e) = conn.execute(&create_view, []) {
-        eprintln!("Warning: Could not create 'data' view: {}", e);
+        warn!("Could not create 'data' view: {}", e);
     }
 
     if track_matches {
